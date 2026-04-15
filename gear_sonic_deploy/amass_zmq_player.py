@@ -4,10 +4,14 @@
 Publishes motion clips from gear_sonic_deploy/reference/motions/*.npz
 as a Pico-compatible ZMQ stream (protocol version 3, PUB socket port 5556).
 
-Required npz keys (written-once convention, §3.0 of plan.md):
+Required npz keys (same three keys as intentele ``MotionLibNPZ`` / ``prepare_dataset`` style):
   fps               scalar > 0          clip frame rate (Hz)
   joint_poses       float32 [T, 24, 3]  world-space joint positions
-  root_orientation  float32 [T, 4]      world-space root quaternion [w, x, y, z]
+  root_orientation  float32 [T, 4]      root quaternion on disk: use ``--root-orientation-disk-order``
+
+``smpl_joints`` and the root row of ``body_quat_w`` follow the same construction as
+``intentele/.../mdp/commands.py`` → ``MotionCommand._apply_heading_alignment`` with
+``heading_delta_quaternion = identity`` (no live robot, so no heading alignment to the robot reset pose).
 
 Key bindings:
   T / t    play / resume (start streaming; clears hold-first-frame)
@@ -20,10 +24,9 @@ Key bindings:
 Usage (from repo root):
   python gear_sonic_deploy/amass_zmq_player.py
   python gear_sonic_deploy/amass_zmq_player.py --vis-smpl   # optional SMPL-24 skeleton window
-  python gear_sonic_deploy/amass_zmq_player.py --yaw-degrees 180   # optional: flip horizontal facing (+Z axis, degrees)
+  python gear_sonic_deploy/amass_zmq_player.py --root-orientation-disk-order wxyz   # if your npz stores scalar-first
 
-The first-frame inverse rotation (plan §3.1) zeros **relative** root orientation at frame 0; it does **not**
-guarantee that the skeleton faces world +X. If your clip faces -X in the viewer, try ``--yaw-degrees 180``.
+Default ``--root-orientation-disk-order xyzw`` matches intentele ``motion_lib_smpl_npz.py`` (scalar last on disk).
 """
 
 from __future__ import annotations
@@ -56,7 +59,6 @@ MOTIONS_DIRECTORY = pathlib.Path(__file__).parent / "reference" / "motions"/ "Ma
 ZMQ_PORT = 5556
 NUM_FRAMES_PER_PACKET = 5   # sub-frames batched into one ZMQ pose message
 JOINT_DOF = 29              # dimension of joint_pos / joint_vel
-ROOT_JOINT_INDEX = 0        # pelvis is joint index 0 inside joint_poses
 
 # SMPL-24 kinematic parents (child index -> parent index; root has -1). Same tree as VR3PtPoseVisualizer.
 SMPL_PARENT_INDICES: Tuple[int, ...] = (
@@ -131,9 +133,9 @@ class SimpleSmplSkeletonWindow:
 
 
 # ---------------------------------------------------------------------------
-# Quaternion convention: [w, x, y, z] throughout this file.
+# Quaternion helpers
+# Internal representation for scipy and for ZMQ ``body_quat_w`` root row: [w, x, y, z].
 # scipy.spatial.transform.Rotation uses [x, y, z, w] (scalar last).
-# Reordering happens in exactly two helper functions below — nowhere else.
 # ---------------------------------------------------------------------------
 
 
@@ -149,6 +151,63 @@ def _rotation_from_wxyz(quaternion_wxyz: np.ndarray) -> Rotation:
     return Rotation.from_quat(_wxyz_to_xyzw(quaternion_wxyz))
 
 
+def _root_orientation_disk_to_internal_wxyz(
+    root_orientation_disk: np.ndarray,
+    disk_component_order: str,
+) -> np.ndarray:
+    """intentele MotionLibNPZ uses xyzw on disk then WXYZ internally; support both layouts."""
+    if disk_component_order == "xyzw":
+        return _xyzw_to_wxyz(root_orientation_disk.astype(np.float64)).astype(np.float32)
+    if disk_component_order == "wxyz":
+        return root_orientation_disk.astype(np.float32)
+    raise ValueError(f"disk_component_order must be 'xyzw' or 'wxyz', got {disk_component_order!r}")
+
+
+def _normalize_quaternion_rows_wxyz(quaternions_wxyz: np.ndarray) -> np.ndarray:
+    rows = quaternions_wxyz.astype(np.float64)
+    norms = np.linalg.norm(rows, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-12, 1.0, norms)
+    return (rows / norms).astype(np.float32)
+
+
+# Identity ``heading_delta_quaternion`` (WXYZ): no robot — same as intentele with identity ``delta_q`` only.
+IDENTITY_QUATERNION_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+
+def _apply_heading_alignment_like_intentele_motion_command(
+    root_orientation_internal_wxyz: np.ndarray,
+    joint_poses_world: np.ndarray,
+    heading_delta_quaternion_wxyz: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Numpy port of ``MotionCommand._apply_heading_alignment`` (intentele ``commands.py``).
+
+    Returns:
+        smpl_joints_body: [T, 24, 3] — root-relative joint vectors in the **aligned** root body frame.
+        root_orientation_aligned_wxyz: [T, 4] — ``quat_mul(delta_q, root_orientation)`` per frame, WXYZ.
+    """
+    num_time_steps = joint_poses_world.shape[0]
+    # Single quaternion must be shape (4,) — (1, 4) makes scipy return as_matrix() as (1, 3, 3) and breaks @ (T, 24, 3).
+    heading_delta_rotation = _rotation_from_wxyz(
+        np.asarray(heading_delta_quaternion_wxyz, dtype=np.float64).reshape(4)
+    )
+    root_rotation_per_frame = _rotation_from_wxyz(root_orientation_internal_wxyz)
+    root_orientation_aligned = heading_delta_rotation * root_rotation_per_frame
+
+    rotation_heading_matrix = heading_delta_rotation.as_matrix()
+    joint_world_after_heading = joint_poses_world @ rotation_heading_matrix.T
+    joint_relative_to_root_world = joint_world_after_heading - joint_world_after_heading[:, 0:1, :]
+
+    smpl_joints_body = np.zeros((num_time_steps, 24, 3), dtype=np.float32)
+    for time_index in range(num_time_steps):
+        vectors_root_frame = root_orientation_aligned[time_index].inv().apply(
+            joint_relative_to_root_world[time_index]
+        )
+        smpl_joints_body[time_index] = vectors_root_frame.astype(np.float32)
+
+    root_orientation_aligned_wxyz = _xyzw_to_wxyz(root_orientation_aligned.as_quat()).astype(np.float32)
+    return smpl_joints_body, root_orientation_aligned_wxyz
+
+
 # ---------------------------------------------------------------------------
 # Per-clip data container
 # ---------------------------------------------------------------------------
@@ -161,15 +220,15 @@ class MotionClip:
         self,
         name: str,
         clip_fps: float,
-        smpl_joints: np.ndarray,               # [T, 24, 3]  float32
-        smpl_pose: np.ndarray,                 # [T, 21, 3]  float32
-        root_quaternion_canonical: np.ndarray, # [T,  4]     float32  wxyz
+        smpl_joints: np.ndarray,  # [T, 24, 3]  float32 — intentele body-frame convention
+        smpl_pose: np.ndarray,  # [T, 21, 3]  float32
+        root_quaternion_heading_aligned_wxyz: np.ndarray,  # [T, 4] float32 — for body_quat_w root row
     ) -> None:
         self.name = name
         self.clip_fps = clip_fps
         self.smpl_joints = smpl_joints
         self.smpl_pose = smpl_pose
-        self.root_quaternion_canonical = root_quaternion_canonical
+        self.root_quaternion_heading_aligned_wxyz = root_quaternion_heading_aligned_wxyz
 
     @property
     def num_frames(self) -> int:
@@ -177,26 +236,15 @@ class MotionClip:
 
 
 # ---------------------------------------------------------------------------
-# Loading and precomputation (plan.md §3.0 – §3.5)
+# Loading and precomputation (intentele MotionCommand + MotionLibNPZ semantics)
 # ---------------------------------------------------------------------------
 
 
-def _apply_extra_world_rotation_about_z(
-    smpl_joints: np.ndarray,
-    root_quaternion_canonical_wxyz: np.ndarray,
-    extra_world_rotation: Rotation,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Apply the same fixed world rotation to joint offsets and root quaternions (left factor)."""
-    extra_matrix = extra_world_rotation.as_matrix()
-    joints_out = (smpl_joints @ extra_matrix.T).astype(np.float32)
-    canonical_rotations = Rotation.from_quat(_wxyz_to_xyzw(root_quaternion_canonical_wxyz))
-    combined = extra_world_rotation * canonical_rotations
-    quat_out = _xyzw_to_wxyz(combined.as_quat()).astype(np.float32)
-    return joints_out, quat_out
-
-
-def _precompute_clip(npz_path: pathlib.Path, extra_world_rotation: Optional[Rotation] = None) -> MotionClip:
-    """Load one .npz, validate, precompute canonical smpl_joints and root quaternions."""
+def _precompute_clip(
+    npz_path: pathlib.Path,
+    root_orientation_disk_component_order: str,
+) -> MotionClip:
+    """Load one .npz; build ``smpl_joints`` like intentele ``_apply_heading_alignment`` (identity delta_q)."""
     data = np.load(npz_path, allow_pickle=False)
 
     for required_key in ("fps", "joint_poses", "root_orientation"):
@@ -207,61 +255,45 @@ def _precompute_clip(npz_path: pathlib.Path, extra_world_rotation: Optional[Rota
     if clip_fps <= 0:
         raise ValueError(f"fps must be > 0, got {clip_fps}")
 
-    joint_poses = data["joint_poses"].astype(np.float32)           # [T, 24, 3]
-    root_orientation = data["root_orientation"].astype(np.float32) # [T,  4] wxyz
+    joint_poses_world = data["joint_poses"].astype(np.float32)
+    root_orientation_disk = data["root_orientation"].astype(np.float32)
 
-    if joint_poses.ndim != 3 or joint_poses.shape[1] != 24 or joint_poses.shape[2] != 3:
-        raise ValueError(f"joint_poses must be [T, 24, 3], got {joint_poses.shape}")
-    if root_orientation.ndim != 2 or root_orientation.shape[1] != 4:
-        raise ValueError(f"root_orientation must be [T, 4], got {root_orientation.shape}")
-    if joint_poses.shape[0] != root_orientation.shape[0]:
+    if joint_poses_world.ndim != 3 or joint_poses_world.shape[1] != 24 or joint_poses_world.shape[2] != 3:
+        raise ValueError(f"joint_poses must be [T, 24, 3], got {joint_poses_world.shape}")
+    if root_orientation_disk.ndim != 2 or root_orientation_disk.shape[1] != 4:
+        raise ValueError(f"root_orientation must be [T, 4], got {root_orientation_disk.shape}")
+    if joint_poses_world.shape[0] != root_orientation_disk.shape[0]:
         raise ValueError(
             f"joint_poses and root_orientation frame count mismatch: "
-            f"{joint_poses.shape[0]} vs {root_orientation.shape[0]}"
+            f"{joint_poses_world.shape[0]} vs {root_orientation_disk.shape[0]}"
         )
-    if joint_poses.shape[0] < 1:
+    if joint_poses_world.shape[0] < 1:
         raise ValueError("clip has zero frames")
 
-    # §3.1 step 1: first-frame root rotation inverse
-    first_frame_rotation = _rotation_from_wxyz(root_orientation[0])
-    first_frame_rotation_inverse = first_frame_rotation.inv()
+    root_orientation_internal_wxyz = _normalize_quaternion_rows_wxyz(
+        _root_orientation_disk_to_internal_wxyz(root_orientation_disk, root_orientation_disk_component_order)
+    )
 
-    # §3.1 step 2: canonical root quaternion sequence
-    # q_canonical[t] = normalize( q_first_inverse ⊗ q_raw[t] )
-    # scipy broadcasts vectorised multiplication correctly; normalisation is automatic.
-    all_frame_rotations = _rotation_from_wxyz(root_orientation)  # vectorised, shape (T,)
-    canonical_rotations = first_frame_rotation_inverse * all_frame_rotations
-    root_quaternion_canonical = _xyzw_to_wxyz(canonical_rotations.as_quat()).astype(np.float32)
+    smpl_joints, root_quaternion_heading_aligned_wxyz = _apply_heading_alignment_like_intentele_motion_command(
+        root_orientation_internal_wxyz,
+        joint_poses_world,
+        IDENTITY_QUATERNION_WXYZ,
+    )
 
-    # §3.1 step 3: canonical joint positions
-    # Order: (a) rotate all joints around world origin with R_first_inverse,
-    #        (b) subtract the rotated root position.
-    # Using row-vector convention: R @ v  ==  v @ R.T
-    rotation_matrix_inverse = first_frame_rotation_inverse.as_matrix()  # [3, 3]
-    joint_positions_rotated = joint_poses @ rotation_matrix_inverse.T   # [T, 24, 3]
-    root_position_rotated = joint_positions_rotated[:, ROOT_JOINT_INDEX : ROOT_JOINT_INDEX + 1, :]  # [T, 1, 3]
-    smpl_joints = (joint_positions_rotated - root_position_rotated).astype(np.float32)
-
-    # §3.2: smpl_pose — zeros (npz minimum set does not include it)
-    smpl_pose = np.zeros((joint_poses.shape[0], 21, 3), dtype=np.float32)
-
-    if extra_world_rotation is not None:
-        smpl_joints, root_quaternion_canonical = _apply_extra_world_rotation_about_z(
-            smpl_joints, root_quaternion_canonical, extra_world_rotation
-        )
+    smpl_pose = np.zeros((joint_poses_world.shape[0], 21, 3), dtype=np.float32)
 
     return MotionClip(
         name=npz_path.stem,
         clip_fps=clip_fps,
         smpl_joints=smpl_joints,
         smpl_pose=smpl_pose,
-        root_quaternion_canonical=root_quaternion_canonical,
+        root_quaternion_heading_aligned_wxyz=root_quaternion_heading_aligned_wxyz,
     )
 
 
 def load_all_clips(
     motions_directory: pathlib.Path,
-    extra_world_rotation: Optional[Rotation] = None,
+    root_orientation_disk_component_order: str,
 ) -> List[MotionClip]:
     npz_files = sorted(motions_directory.glob("*.npz"))
     if not npz_files:
@@ -270,7 +302,10 @@ def load_all_clips(
     clips = []
     for npz_path in npz_files:
         try:
-            clip = _precompute_clip(npz_path, extra_world_rotation=extra_world_rotation)
+            clip = _precompute_clip(
+                npz_path,
+                root_orientation_disk_component_order=root_orientation_disk_component_order,
+            )
             print(f"  loaded  {npz_path.name:<40}  {clip.num_frames} frames @ {clip.clip_fps} fps")
             clips.append(clip)
         except Exception as error:
@@ -295,7 +330,7 @@ def _build_pose_packet(
     pose_data = {
         "smpl_pose":   clip.smpl_pose[clip_local_frame_indices],                # [B, 21, 3]
         "smpl_joints": clip.smpl_joints[clip_local_frame_indices],              # [B, 24, 3]
-        "body_quat_w": clip.root_quaternion_canonical[clip_local_frame_indices],# [B,  4]
+        "body_quat_w": clip.root_quaternion_heading_aligned_wxyz[clip_local_frame_indices],  # [B, 4]
         "joint_pos":   np.zeros((batch_size, JOINT_DOF), dtype=np.float32),
         "joint_vel":   np.zeros((batch_size, JOINT_DOF), dtype=np.float32),
         "frame_index": np.array(global_frame_indices, dtype=np.int64),
@@ -489,24 +524,21 @@ def main() -> None:
         help="Open a minimal PyVista window: SMPL-24 skeleton only (no G1, no VR).",
     )
     parser.add_argument(
-        "--yaw-degrees",
-        type=float,
-        default=0.0,
+        "--root-orientation-disk-order",
+        choices=("xyzw", "wxyz"),
+        default="xyzw",
         help=(
-            "After §3.1 canonicalization, rotate the whole clip by this yaw about world +Z (degrees). "
-            "Example: 180 if the character faces -X but you want +X in the viewer / deploy frame."
+            "Component order of ``root_orientation`` inside the npz on disk. "
+            "``xyzw`` matches intentele ``motion_lib_smpl_npz.py``; use ``wxyz`` for scalar-first files."
         ),
     )
     arguments = parser.parse_args()
 
-    extra_world_rotation: Optional[Rotation] = None
-    if abs(arguments.yaw_degrees) > 1e-9:
-        extra_world_rotation = Rotation.from_euler("z", float(np.deg2rad(arguments.yaw_degrees)))
-
     print(f"Scanning {MOTIONS_DIRECTORY} ...")
-    clips = load_all_clips(MOTIONS_DIRECTORY, extra_world_rotation=extra_world_rotation)
-    if extra_world_rotation is not None:
-        print(f"  extra world yaw about +Z: {arguments.yaw_degrees:g} deg")
+    clips = load_all_clips(
+        MOTIONS_DIRECTORY,
+        root_orientation_disk_component_order=arguments.root_orientation_disk_order,
+    )
 
     smpl_skeleton_viewer: Optional[SimpleSmplSkeletonWindow] = None
     if arguments.vis_smpl:
