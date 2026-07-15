@@ -342,5 +342,87 @@ class SimLoopConfig(BaseConfig):
     camera_port: int = 5555
     """Camera port for image publishing"""
 
+    enable_ros2_joint_state: bool = False
+    """If True, publish sensor_msgs/JointState while the MuJoCo sim loop runs (requires ROS 2)."""
+
+    enable_ros2_tf: bool = False
+    """If True, broadcast world->pelvis TF while the MuJoCo sim loop runs (requires ROS 2)."""
+
+    ros2_tf_parent_frame_id: str = "world"
+    """Parent frame for the pelvis transform (matches lidar / elevation map frame)."""
+
+    ros2_tf_child_frame_id: str = "pelvis"
+    """Child frame for the pelvis transform."""
+
+    ros2_tf_body_name: str = "pelvis"
+    """MuJoCo body name used for pose (must match child_frame_id semantics)."""
+
+    ros2_tf_rate_hz: float = 50.0
+    """Approximate broadcast rate for TF (Hz)."""
+
+    ros2_joint_state_topic: str = "/joint_states"
+    """ROS 2 topic name for JointState."""
+
+    ros2_joint_state_rate_hz: float = 50.0
+    """Approximate publish rate for JointState (Hz)."""
+
+    enable_ros2_elevation_map: bool = False
+    """If True, compute a heading-aligned elevation map via mj_ray and publish it (requires ROS 2)."""
+
+    ros2_elevation_map_topic: str = "/elevation_map"
+    """ROS 2 topic name for the elevation map (grid_map_msgs/GridMap, layer ``elevation``)."""
+
+    ros2_elevation_map_body_name: str = "torso_link"
+    """MuJoCo body name for height-scanner pose and heading (default: torso_link)."""
+
+    ros2_elevation_map_rate_hz: float = 20.0
+    """Approximate publish rate for the elevation map (Hz)."""
+
+    ros2_elevation_map_terrain_geom_group: int = 2
+    """MuJoCo geom group used for terrain-only raycasts (``group=2`` in scene XML)."""
+
+    show_elevation_viewer_markers: bool = False
+    """Draw red sphere markers at elevation ray hits in the MuJoCo viewer (debug only).
+
+    Disabled by default — 225 ``mjv_initGeom`` calls per viewer frame cost ~3–6 Hz on
+    ``/elevation_map``.  Enable with ``--show-elevation-viewer-markers`` when debugging.
+    """
+
+    enable_ros2_lidar_pointcloud: bool = False
+    """If True, publish sensor_msgs/PointCloud2 from simulated LiDAR (requires ROS 2 and mujoco-lidar)."""
+
+    ros2_lidar_pointcloud_topic: str = "/lidar_points"
+    """ROS 2 topic name for PointCloud2."""
+
+    ros2_lidar_pointcloud_rate_hz: float = 10.0
+    """Approximate publish rate for lidar point cloud (Hz)."""
+
+    enable_ros2_body_state: bool = False
+    """If True, publish world-frame pose and velocity for every MuJoCo body (requires ROS 2)."""
+
+    ros2_body_state_topic_prefix: str = "/sim/bodies"
+    """Topic prefix for body state publishers ({prefix}/poses, {prefix}/velocities, {prefix}/names)."""
+
+    ros2_body_state_rate_hz: float = 50.0
+    """Approximate publish rate for body state (Hz). Default matches physics rate."""
+
+    enable_ros2_sim_reset: bool = False
+    """If True, subscribe to /sim/reset (std_msgs/Empty) and reset MuJoCo to initial pose."""
+
+    ros2_sim_reset_topic: str = "/sim/reset"
+    """ROS 2 topic to trigger sim reset."""
+
+    ros2_release_band_topic: str = "/sim/release_band"
+    """ROS 2 topic to disable the MuJoCo elastic band (same as key 9)."""
+
+    lidar_site_name: str = "lidar"
+    """Name of the MuJoCo site used as LiDAR origin."""
+
+    lidar_scan_type: str = "mid360"
+    """LiDAR scan pattern: 'mid360' (Livox, ~24000 rays) or 'grid' (60×16, CPU-friendly)."""
+
+    lidar_backend: str = "jax"
+    """MuJoCo-LiDAR backend for mid360: 'jax' (GPU), 'taichi' (GPU), or 'cpu'."""
+
     verbose: bool = False
     """Verbose output, override the base config verbose"""

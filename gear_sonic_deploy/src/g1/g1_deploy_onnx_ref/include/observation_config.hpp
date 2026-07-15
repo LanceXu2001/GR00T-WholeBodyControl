@@ -91,11 +91,37 @@ struct EncoderConfig {
 };
 
 /**
+ * @brief Optional residual multi-layer perceptron (encoder–decoder) settings from YAML.
+ *
+ * When enabled, the deployment expects model_residual.onnx and matching input layout;
+ * see gear_sonic_deploy/plan.md for the observation contract.
+ */
+struct ResidualConfig {
+  bool enabled = false;
+  bool use_fp16 = false;
+  /// Per-control-step size of the stored residual output history (typically equals token dimension, e.g. 64).
+  int last_delta_z_step_dimension = 64;
+  /// Grid dimensions must match the elevation publisher and the trained ONNX model.
+  int height_scanner_row_count = 0;
+  int height_scanner_column_count = 0;
+  /// Number of historical frames kept for the height scanner buffer.
+  /// Independent from the delta-history step count (kResidualHistoryStepCount).
+  /// Default 10 preserves the previous behaviour when not set in YAML.
+  int height_scanner_history_steps = 10;
+  /// Control ticks between height-map history pushes. Must match training
+  /// ``height_scanner.update_period / step_dt`` (Intentele: 5 → 10 Hz at 50 Hz control).
+  int height_map_refresh_interval = 5;
+  // Note: the ROS2 elevation topic is a deployment constant (kResidualElevationMapTopic),
+  // not a YAML parameter. See ros2_elevation_cache.hpp.
+};
+
+/**
  * @brief Combined configuration containing observations and optional encoder
  */
 struct FullObservationConfig {
   std::vector<ObservationConfig> observations;
   EncoderConfig encoder;
+  ResidualConfig residual;
 };
 
 /**
@@ -336,8 +362,87 @@ public:
     if (full_config.encoder.dimension > 0) {
       std::cout << "Encoder config found with " << full_config.encoder.encoder_observations.size() << " input observations" << std::endl;
     }
-    
+
+    full_config.residual = ParseResidualSection(config_path);
+    if (full_config.residual.enabled) {
+      std::cout << "Residual section: enabled=true, height_scanner grid "
+                << full_config.residual.height_scanner_row_count
+                << " x " << full_config.residual.height_scanner_column_count << std::endl;
+    }
+
     return full_config;
+  }
+
+  /**
+   * @brief Reads the optional top-level `residual:` block from the same YAML file.
+   *
+   * Parsing stops when another top-level section (`observations:` or `encoder:`) begins.
+   */
+  static ResidualConfig ParseResidualSection(const std::string& config_path) {
+    ResidualConfig residual;
+    std::ifstream file(config_path);
+    if (!file.is_open()) {
+      return residual;
+    }
+    std::string line;
+    bool inside_residual_block = false;
+    while (std::getline(file, line)) {
+      const size_t first_non_space = line.find_first_not_of(" \t\r");
+      if (first_non_space == std::string::npos) {
+        continue;
+      }
+      if (line[first_non_space] == '#') {
+        continue;
+      }
+      const bool line_starts_at_column_zero = (first_non_space == 0);
+      std::string trimmed = line.substr(first_non_space);
+
+      if (trimmed.rfind("residual:", 0) == 0) {
+        inside_residual_block = true;
+        continue;
+      }
+      if (inside_residual_block && line_starts_at_column_zero &&
+          (trimmed.rfind("observations:", 0) == 0 || trimmed.rfind("encoder:", 0) == 0)) {
+        inside_residual_block = false;
+        break;
+      }
+      if (!inside_residual_block) {
+        continue;
+      }
+
+      if (trimmed.rfind("enabled:", 0) == 0) {
+        residual.enabled = ExtractBoolValue(trimmed, "enabled:");
+      } else if (trimmed.rfind("use_fp16:", 0) == 0) {
+        residual.use_fp16 = ExtractBoolValue(trimmed, "use_fp16:");
+      } else if (trimmed.rfind("last_delta_z_step_dimension:", 0) == 0) {
+        try {
+          residual.last_delta_z_step_dimension = std::stoi(ExtractValue(trimmed, "last_delta_z_step_dimension:"));
+        } catch (...) {
+        }
+      } else if (trimmed.rfind("height_scanner_row_count:", 0) == 0) {
+        try {
+          residual.height_scanner_row_count = std::stoi(ExtractValue(trimmed, "height_scanner_row_count:"));
+        } catch (...) {
+        }
+      } else if (trimmed.rfind("height_scanner_column_count:", 0) == 0) {
+        try {
+          residual.height_scanner_column_count = std::stoi(ExtractValue(trimmed, "height_scanner_column_count:"));
+        } catch (...) {
+        }
+      } else if (trimmed.rfind("height_scanner_history_steps:", 0) == 0) {
+        try {
+          residual.height_scanner_history_steps = std::stoi(ExtractValue(trimmed, "height_scanner_history_steps:"));
+        } catch (...) {
+        }
+      } else if (trimmed.rfind("height_map_refresh_interval:", 0) == 0) {
+        try {
+          residual.height_map_refresh_interval = std::stoi(ExtractValue(trimmed, "height_map_refresh_interval:"));
+        } catch (...) {
+        }
+      }
+      // Note: elevation_map_topic is a deployment constant; ignore it if present in legacy YAML.
+    }
+    return residual;
   }
 
   /**

@@ -90,14 +90,11 @@ public:
      */
     explicit ROS2OutputHandler(StateLogger& logger, const std::string& node_name = "g1_output_handler") 
         : OutputInterface(logger) {
-        // Initialize ROS2 if not already initialized
         if (!rclcpp::ok()) {
-            if constexpr (DEBUG_LOGGING) {
-                std::cout << "[ROS2 Output DEBUG] Initializing ROS2" << std::endl;
-            }
-            rclcpp::init(0, nullptr);
+            throw std::runtime_error(
+                "ROS2OutputHandler requires rclcpp::init() in main() before construction");
         }
-        
+
         try {
             // Initialize ROS2 node
             node_ = rclcpp::Node::make_shared(node_name);

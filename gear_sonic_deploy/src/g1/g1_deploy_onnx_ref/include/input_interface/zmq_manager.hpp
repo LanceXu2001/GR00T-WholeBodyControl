@@ -37,6 +37,7 @@
  *   g/G, h/H | Left-hand compliance ±0.1
  *   b/B, v/V | Right-hand compliance ±0.1
  *   x/X, c/C | Hand max-close ratio ±0.1
+ *   Y/y  | Toggle residual correction (encoder + delta*0.2 → decoder)
  */
 
 #ifndef ZMQ_MANAGER_HPP
@@ -215,6 +216,11 @@ class ZMQManager : public InputInterface {
           case 'C':
             // Decrease max close ratio by 0.1 (keep hands more open)
             AdjustMaxCloseRatio(-0.1);
+            is_manager_key = true;
+            break;
+          case 'y':
+          case 'Y':
+            ToggleResidualCorrection();
             is_manager_key = true;
             break;
         }

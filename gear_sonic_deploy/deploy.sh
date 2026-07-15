@@ -204,6 +204,7 @@ show_usage() {
     echo ""
     echo "Options:"
     echo "  -h, --help              Show this help message"
+    echo "  --debug                 Build and run in Debug mode (for debugging with GDB)"
     echo "  --cp, --checkpoint PATH Set the checkpoint path (default: policy/checkpoints/example/model_step_000000)"
     echo "  --obs-config PATH       Set the observation config file (default: policy/configs/example.yaml)"
     echo "  --planner PATH          Set the planner model path (default: planner/example.onnx)"
@@ -234,8 +235,12 @@ show_usage() {
 # Default interface mode
 INTERFACE_MODE="real"
 
+# Build type (Release or Debug)
+BUILD_TYPE="Release"
+
 # Default configuration values (can be overridden by command line)
 CHECKPOINT_DEFAULT="policy/release/model"
+RESIDUAL_MODEL_DEFAULT="policy/release/model_residual.onnx"
 OBS_CONFIG_DEFAULT="policy/release/observation_config.yaml"
 PLANNER_DEFAULT="planner/target_vel/V2/planner_sonic.onnx"
 MOTION_DATA_DEFAULT="reference/example/"
@@ -315,6 +320,11 @@ while [[ $# -gt 0 ]]; do
             ZMQ_HOST="$2"
             shift 2
             ;;
+        --debug)
+            BUILD_TYPE="Debug"
+            echo -e "${YELLOW}🔧 Debug mode enabled${NC}"
+            shift
+            ;;
         sim|real)
             INTERFACE_MODE="$1"
             shift
@@ -383,8 +393,14 @@ CHECKPOINT_ENCODER="${CHECKPOINT}_encoder.onnx"
 EXTRA_ARGS=""
 if [[ "$ENV_TYPE" == "sim" ]]; then
     EXTRA_ARGS="--disable-crc-check"
+    EXTRA_ARGS="$EXTRA_ARGS --enable-csv-logs"
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
     echo ""
+    if [[ -f "$RESIDUAL_MODEL_DEFAULT" ]]; then
+        EXTRA_ARGS="$EXTRA_ARGS --residual-model $RESIDUAL_MODEL_DEFAULT"
+        echo -e "${YELLOW}📋 Residual model: $RESIDUAL_MODEL_DEFAULT${NC}"
+        echo ""
+    fi
 fi
 
 # ============================================================================
@@ -490,8 +506,12 @@ source scripts/setup_env.sh
 set -e  # Re-enable exit on error
 
 # Always build to ensure we have the latest version
-echo "Building the project..."
-just build
+echo "Building the project in ${BUILD_TYPE} mode..."
+if [[ "$BUILD_TYPE" == "Debug" ]]; then
+    just build Debug
+else
+    just build Release
+fi
 
 echo ""
 
@@ -515,6 +535,7 @@ echo -e "  Planner:            ${GREEN}$PLANNER${NC}"
 echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
+echo -e "  Build Type:         ${GREEN}$BUILD_TYPE${NC}"
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "  Extra Args:         ${GREEN}$EXTRA_ARGS${NC}"
 fi
@@ -523,7 +544,11 @@ echo -e "${CYAN}═════════════════════�
 echo ""
 echo -e "${YELLOW}The following command will be executed:${NC}"
 echo ""
-echo -e "${BLUE}just run g1_deploy_onnx_ref $TARGET $CHECKPOINT_DECODER $MOTION_DATA \\${NC}"
+if [[ "$BUILD_TYPE" == "Debug" ]]; then
+    echo -e "${BLUE}just run-debug g1_deploy_onnx_ref $TARGET $CHECKPOINT_DECODER $MOTION_DATA \\${NC}"
+else
+    echo -e "${BLUE}just run g1_deploy_onnx_ref $TARGET $CHECKPOINT_DECODER $MOTION_DATA \\${NC}"
+fi
 echo -e "${BLUE}    --obs-config $OBS_CONFIG \\${NC}"
 echo -e "${BLUE}    --encoder-file $CHECKPOINT_ENCODER \\${NC}"
 echo -e "${BLUE}    --planner-file $PLANNER \\${NC}"
@@ -552,23 +577,46 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo ""
     
     # Build the command with optional extra args
-    if [[ -n "$EXTRA_ARGS" ]]; then
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
-            --obs-config "$OBS_CONFIG" \
-            --encoder-file "$CHECKPOINT_ENCODER" \
-            --planner-file "$PLANNER" \
-            --input-type "$INPUT_TYPE" \
-            --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST" \
-            $EXTRA_ARGS
+    if [[ "$BUILD_TYPE" == "Debug" ]]; then
+        # Use run-debug for Debug builds
+        if [[ -n "$EXTRA_ARGS" ]]; then
+            just run-debug g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+                --obs-config "$OBS_CONFIG" \
+                --encoder-file "$CHECKPOINT_ENCODER" \
+                --planner-file "$PLANNER" \
+                --input-type "$INPUT_TYPE" \
+                --output-type "$OUTPUT_TYPE" \
+                --zmq-host "$ZMQ_HOST" \
+                $EXTRA_ARGS
+        else
+            just run-debug g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+                --obs-config "$OBS_CONFIG" \
+                --encoder-file "$CHECKPOINT_ENCODER" \
+                --planner-file "$PLANNER" \
+                --input-type "$INPUT_TYPE" \
+                --output-type "$OUTPUT_TYPE" \
+                --zmq-host "$ZMQ_HOST"
+        fi
     else
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
-            --obs-config "$OBS_CONFIG" \
-            --encoder-file "$CHECKPOINT_ENCODER" \
-            --planner-file "$PLANNER" \
-            --input-type "$INPUT_TYPE" \
-            --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST"
+        # Use run for Release builds
+        if [[ -n "$EXTRA_ARGS" ]]; then
+            just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+                --obs-config "$OBS_CONFIG" \
+                --encoder-file "$CHECKPOINT_ENCODER" \
+                --planner-file "$PLANNER" \
+                --input-type "$INPUT_TYPE" \
+                --output-type "$OUTPUT_TYPE" \
+                --zmq-host "$ZMQ_HOST" \
+                $EXTRA_ARGS
+        else
+            just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+                --obs-config "$OBS_CONFIG" \
+                --encoder-file "$CHECKPOINT_ENCODER" \
+                --planner-file "$PLANNER" \
+                --input-type "$INPUT_TYPE" \
+                --output-type "$OUTPUT_TYPE" \
+                --zmq-host "$ZMQ_HOST"
+        fi
     fi
 else
     echo ""

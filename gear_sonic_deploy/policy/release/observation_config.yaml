@@ -78,3 +78,22 @@ encoder:
         - smpl_joints_10frame_step1
         - smpl_anchor_orientation_10frame_step1
         - motion_joint_positions_wrists_10frame_step1
+
+# Optional residual MLP between encoder and decoder.
+# When enabled, also pass --residual-model path/to/model_residual.onnx on the command line.
+# At runtime: token_state += residual_output * 0.2 before the decoder.
+# Keyboard Y/y toggles residual correction (default ENABLED when the stack loads).
+# The elevation map ROS2 topic is fixed in code (kResidualElevationMapTopic = "/elevation_map").
+residual:
+  enabled: true
+  use_fp16: false
+  last_delta_z_step_dimension: 64
+  # Height map grid: H x W. Training format is (T, H, W) elevation history.
+  # Grid must match the elevation publisher. Set to 15x15 to match training.
+  height_scanner_row_count: 15
+  height_scanner_column_count: 15
+  # Number of historical elevation frames encoded into height_map_2d_history5 (must match ONNX).
+  height_scanner_history_steps: 5
+  # Control ticks between height-map history pushes (must match training update_period / step_dt).
+  # 5 @ 50 Hz control → 10 Hz, matching Intentele height_scanner.update_period.
+  height_map_refresh_interval: 5

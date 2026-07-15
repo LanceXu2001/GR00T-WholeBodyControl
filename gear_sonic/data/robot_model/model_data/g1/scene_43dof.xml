@@ -19,12 +19,35 @@
 
   <worldbody>
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
-    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" group="2"/>
     <!-- Site -->
     <site name="com_marker" pos="0.1 0 0" size="0.05" rgba="1 0 0 1" type="sphere"/>
+
+    <!-- <body name="slope_stair2" pos="-6 0 0" quat="1 0 0 0">
+     <geom pos="0 0 0.375" type="box"  size="1.072 1.75 0.01" quat="0.984 0 -0.178 0" group="2"/>
+     <geom pos="2.5 0 0.75" type="box"  size="1.5 1.75 0.01" quat="1 0 0 0" group="2"/>
+     <geom pos="3.825 0 0.375" type="box"  size="0.175 1.75 0.375" quat="1 0 0 0" group="2"/>
+     <geom pos="4.175 0 0.3" type="box"  size="0.175 1.75 0.3" quat="1 0 0 0" group="2"/>
+     <geom pos="4.525 0 0.225" type="box"  size="0.175 1.75 0.225" quat="1 0 0 0" group="2"/>
+     <geom pos="4.875 0 0.150" type="box"  size="0.175 1.75 0.150" quat="1 0 0 0" group="2"/>
+     <geom pos="5.225 0 0.075" type="box"  size="0.175 1.75 0.075" quat="1 0 0 0" group="2"/>
+    </body> -->
+
+    <!-- slope_stair3: step_width=0.4 m, step_height=0.15 m (intentele training: step_width=0.4, step_height_range=(0,0.2)) -->
+    <body name="slope_stair3" pos="-6 0 0" quat="1 0 0 0">
+     <geom pos="0 0 0.375" type="box"  size="1.072 1.75 0.01" quat="0.984 0 -0.178 0" group="2"/>
+     <geom pos="2.5 0 0.75" type="box"  size="1.5 1.75 0.01" quat="1 0 0 0" group="2"/>
+     <geom pos="3.8 0 0.375" type="box"  size="0.2 1.75 0.375" quat="1 0 0 0" group="2"/>
+     <geom pos="4.2 0 0.3" type="box"  size="0.2 1.75 0.3" quat="1 0 0 0" group="2"/>
+     <geom pos="4.6 0 0.225" type="box"  size="0.2 1.75 0.225" quat="1 0 0 0" group="2"/>
+     <geom pos="5.0 0 0.150" type="box"  size="0.2 1.75 0.150" quat="1 0 0 0" group="2"/>
+     <geom pos="5.4 0 0.075" type="box"  size="0.2 1.75 0.075" quat="1 0 0 0" group="2"/>
+    </body>
   </worldbody>
 
   <default>
     <geom friction="1.0"/>
   </default>
+
+  
 </mujoco>

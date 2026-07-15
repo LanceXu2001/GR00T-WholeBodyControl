@@ -53,6 +53,7 @@
 #include <rclcpp/exceptions/exceptions.hpp>
 #include <std_msgs/msg/byte_multi_array.hpp>  // For msgpack-serialized messages
 #include <array>
+#include <stdexcept>
 #include <memory>
 #include <atomic>
 #include <mutex>
@@ -144,14 +145,11 @@ public:
         tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
         fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
         
-        // Initialize ROS2 - this is the only ROS2 component in the system
         if (!rclcpp::ok()) {
-            if constexpr (DEBUG_LOGGING) {
-                std::cout << "[ROS2 DEBUG] Initializing ROS2" << std::endl;
-            }
-            rclcpp::init(0, nullptr);  // Initialize with no command line arguments
+            throw std::runtime_error(
+                "ROS2InputHandler requires rclcpp::init() in main() before construction");
         }
-        
+
         try {
             // Initialize ROS2 node
             node_ = rclcpp::Node::make_shared(node_name);
@@ -210,16 +208,7 @@ public:
                 }
                 node_.reset();
             }
-            
-            // Step 5: Only shutdown if we're the last ROS2 component
-            // Note: Be careful about calling shutdown() if other ROS2 components exist
-            if (rclcpp::ok()) {
-                if constexpr (DEBUG_LOGGING) {
-                    std::cout << "[ROS2 DEBUG] Shutting down ROS2 context" << std::endl;
-                }
-                rclcpp::shutdown();
-            }
-            
+
         } catch (const std::exception& e) {
             if constexpr (DEBUG_LOGGING) {
                 std::cout << "[ROS2 ERROR] Exception during cleanup: " << e.what() << std::endl;

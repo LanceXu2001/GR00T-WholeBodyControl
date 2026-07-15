@@ -192,3 +192,16 @@ uv.lock
 xrobotoolkit_sdk.cpython-*-*-*.so
 teleop_vids/
 *.code-workspace
+
+# gear_sonic_deploy local build / runtime artifacts
+gear_sonic_deploy/_build_*/
+gear_sonic_deploy/ros2_ws/
+gear_sonic_deploy/third_party/
+gear_sonic_deploy/collect/
+gear_sonic_deploy/reference/motions/
+gear_sonic_deploy/*.npy
+gear_sonic_deploy/*.log
+
+# Local notes / env dumps
+setup_notion.txt
+my_env.yml

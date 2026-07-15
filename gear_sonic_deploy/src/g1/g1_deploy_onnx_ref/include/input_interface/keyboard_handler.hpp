@@ -21,6 +21,7 @@
  *   I/i | Reinitialise heading (recapture IMU)
  *   Enter | Toggle planner mode
  *   Z/z | Toggle encoder mode
+ *   Y/y | Toggle residual correction (encoder + delta*0.2 → decoder)
  *
  * ### Planner mode (Enter to toggle)
  *   Key | Action
@@ -36,6 +37,7 @@
  *   R/` | Emergency stop (reset momentum)
  *   T/t | Play motion
  *   Z/z | Toggle encoder mode
+ *   Y/y | Toggle residual correction (encoder + delta*0.2 → decoder)
  *
  * Movement uses a momentum system: pressing a direction key sets momentum to
  * 1.0; each frame without input decays it by `momentum_decay_rate`.  Below
@@ -255,6 +257,8 @@ class SimpleKeyboard : public InputInterface {
                 case 'Z': encoder_mode_toggle = true; break; // Toggle encoder mode
                 case 'f':
                 case 'F': report_temperature = true; break; // Report motor temperatures
+                case 'y':
+                case 'Y': ToggleResidualCorrection(); break; // Toggle residual correction
             }
 
             // Limit movement speed and height to the range of the movement mode
@@ -317,6 +321,8 @@ class SimpleKeyboard : public InputInterface {
             case 'Z': encoder_mode_toggle = true; break; // Toggle encoder mode
             case 'h':
             case 'H': report_temperature = true; break; // Report motor temperatures
+            case 'y':
+            case 'Y': ToggleResidualCorrection(); break; // Toggle residual correction
           }
         }
         

@@ -1,0 +1,27 @@
+output:
+  root_dir: "collect/my_experiment_001"
+
+reference:
+  npz_path: "reference/motions/Male2Walking_c3d/B4 - Stand to Walk backwards_poses.npz"
+  target_fps: 50.0
+
+collection:
+  num_trials: 3
+  trial_timeout_sec: 60.0
+
+stop_conditions:
+  fall_height_threshold: 0.2   # pelvis z below this → fallen (matches base_sim.check_fall)
+  ref_idle_sec: 2.0            # seconds to wait after clip finishes before next trial
+
+processes:
+  start_sim: false             # set true to launch sim as subprocess
+  start_deploy: false          # set true to launch deploy as subprocess
+  sim_args:
+    - "--enable-ros2-tf"
+    # - "--enable-ros2-elevation-map"
+    - "--enable-ros2-body-state"
+    - "--ros2-body-state-rate-hz=200"
+    - "--enable-ros2-sim-reset"
+  deploy_args:
+    - "--input-type"
+    - "zmq_manager"

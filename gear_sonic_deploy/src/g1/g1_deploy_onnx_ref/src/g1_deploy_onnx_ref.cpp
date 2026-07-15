@@ -38,6 +38,7 @@
  *   --motion-data         | Directory of pre-loaded reference motions
  *   --obs-config          | Observation config YAML
  *   --encoder-model       | Encoder ONNX model (for token_state)
+ *   --residual-model      | Optional residual ONNX (obs_dict -> delta_token); requires residual.enabled in YAML
  *   --planner-model       | Locomotion planner ONNX model
  *   --input-type          | keyboard / gamepad / zmq / ros2 / interface_manager / gamepad_manager / zmq_manager
  *   --output-type         | zmq / ros2 / all
@@ -113,10 +114,11 @@
 // Output interface and output handlers
 #include "../include/output_interface/output_interface.hpp"
 
-// Optional ROS2 input handler
+// Optional ROS2 input handler and dedicated elevation-ingest cache
 #if HAS_ROS2
 #include "../include/input_interface/ros2_input_handler.hpp"
 #include "../include/output_interface/ros2_output_handler.hpp"
+#include "../include/input_interface/ros2_elevation_cache.hpp"
 #endif
 
 #include "../include/output_interface/zmq_output_handler.hpp"
@@ -126,6 +128,9 @@
 
 // Encoder
 #include "../include/encoder.hpp"
+
+// Optional residual network (encoder to decoder)
+#include "../include/residual_engine.hpp"
 
 // Control policy
 #include "../include/control_policy.hpp"
@@ -335,6 +340,9 @@ class G1Deploy {
 
     // State logger
     std::unique_ptr<StateLogger> state_logger_;
+
+    // CSV for logging encoder input observations (one row per control tick)
+    std::ofstream encoder_obs_csv_;
     
     // Output interfaces (supports multiple simultaneous outputs)
     std::vector<std::unique_ptr<OutputInterface>> output_interfaces_;
@@ -357,7 +365,24 @@ class G1Deploy {
     
     // Control policy
     std::unique_ptr<PolicyEngine> policy_engine_;
-    
+
+    // Optional residual stack (YAML + --residual-model)
+    ResidualConfig residual_config_;
+    std::unique_ptr<ResidualEngine> residual_engine_;
+    bool residual_stack_enabled_ = false;
+    std::string residual_model_file_path_argument_;
+    std::vector<float> last_delta_z_time_series_;
+    std::vector<float> height_scanner_time_series_;
+    /// Counts residual control ticks; used to gate height-map history pushes.
+    int height_map_refresh_step_counter_ = 0;
+#if HAS_ROS2
+    /// Dedicated thread that subscribes to the elevation GridMap topic and
+    /// caches the latest frame.  Created when residual_stack_enabled_ is true.
+    std::unique_ptr<Ros2ElevationCache> elevation_cache_;
+#endif
+    static constexpr int kResidualHistoryStepCount = 10;
+    static constexpr float kResidualTokenScale = 0.2f;
+
     // =========================================================================
     // Observation system configuration and runtime state
     // =========================================================================
@@ -1640,6 +1665,207 @@ class G1Deploy {
     //      GatherInputInterfaceData() from ZMQ / ROS2.
     // =========================================================================
 
+    size_t compute_expected_obs_dict_element_count() const {
+      // Must mirror obs_dict packing in build_residual_input_vector() (no height map).
+      const size_t token_dim       = (encoder_config_.dimension > 0)
+                                     ? static_cast<size_t>(encoder_config_.dimension) : 64;
+      const size_t delta_history_dim = static_cast<size_t>(kResidualHistoryStepCount) *
+                                       static_cast<size_t>(residual_config_.last_delta_z_step_dimension);
+      const size_t decoder_obs_dim = 30 + 290 + 290 + 290 + 30;
+      return token_dim + delta_history_dim + decoder_obs_dim;
+    }
+
+    size_t compute_expected_decoder_history_element_count() const {
+      const size_t decoder_obs_dim = 30 + 290 + 290 + 290 + 30;
+      return decoder_obs_dim;
+    }
+
+    size_t compute_expected_height_map_element_count() const {
+      return static_cast<size_t>(residual_config_.height_scanner_history_steps) *
+             static_cast<size_t>(residual_config_.height_scanner_row_count) *
+             static_cast<size_t>(residual_config_.height_scanner_column_count);
+    }
+
+    void shift_push_height_scanner_time_series(const std::vector<float>& newest_row_major_frame) {
+      const size_t block_size = static_cast<size_t>(residual_config_.height_scanner_row_count) *
+                                static_cast<size_t>(residual_config_.height_scanner_column_count);
+      if (height_scanner_time_series_.size() != block_size * static_cast<size_t>(residual_config_.height_scanner_history_steps)) {
+        return;
+      }
+      std::copy(height_scanner_time_series_.begin() + static_cast<std::ptrdiff_t>(block_size),
+                height_scanner_time_series_.end(), height_scanner_time_series_.begin());
+      for (size_t i = 0; i < block_size; ++i) {
+        const float value = (i < newest_row_major_frame.size()) ? newest_row_major_frame[i] : 0.0f;
+        height_scanner_time_series_[height_scanner_time_series_.size() - block_size + i] = value;
+      }
+    }
+
+    void shift_push_last_delta_z_time_series(const std::vector<float>& newest_delta_step) {
+      const size_t block_size = static_cast<size_t>(residual_config_.last_delta_z_step_dimension);
+      if (last_delta_z_time_series_.size() != block_size * static_cast<size_t>(kResidualHistoryStepCount)) {
+        return;
+      }
+      std::copy(last_delta_z_time_series_.begin() + static_cast<std::ptrdiff_t>(block_size),
+                last_delta_z_time_series_.end(), last_delta_z_time_series_.begin());
+      for (size_t i = 0; i < block_size; ++i) {
+        const float value = (i < newest_delta_step.size()) ? newest_delta_step[i] : 0.0f;
+        last_delta_z_time_series_[last_delta_z_time_series_.size() - block_size + i] = value;
+      }
+    }
+
+    bool copy_named_observation_to_float_buffer(const std::string& observation_name,
+                                                const std::vector<ObservationRegistry>& registry,
+                                                TPinnedVector<float>& destination,
+                                                size_t& write_index) {
+      auto iterator = std::find_if(registry.begin(), registry.end(),
+                                   [&observation_name](const ObservationRegistry& entry) { return entry.name == observation_name; });
+      if (iterator == registry.end()) {
+        std::cerr << "Residual pipeline: observation '" << observation_name << "' is not registered." << std::endl;
+        return false;
+      }
+      std::vector<double> temporary_double_buffer(iterator->dimension);
+      if (!iterator->function(temporary_double_buffer, 0)) {
+        std::cerr << "Residual pipeline: failed to gather '" << observation_name << "'." << std::endl;
+        return false;
+      }
+      for (size_t i = 0; i < temporary_double_buffer.size(); ++i) {
+        destination[write_index++] = static_cast<float>(temporary_double_buffer[i]);
+      }
+      return true;
+    }
+
+    bool fill_height_map_history_buffer(TPinnedVector<float>& height_map_input, size_t& write_index) {
+      const int H = residual_config_.height_scanner_row_count;
+      const int W = residual_config_.height_scanner_column_count;
+      const size_t frame_size = static_cast<size_t>(H * W);
+      const size_t history_steps = static_cast<size_t>(residual_config_.height_scanner_history_steps);
+      auto clip5 = [](float v) { return std::max(-5.0f, std::min(5.0f, v)); };
+
+      if (height_scanner_time_series_.size() != frame_size * history_steps) {
+        std::cerr << "Residual pipeline: height_scanner_time_series size mismatch." << std::endl;
+        return false;
+      }
+      for (size_t frame = 0; frame < history_steps; ++frame) {
+        const float* frame_data = height_scanner_time_series_.data() + frame * frame_size;
+        for (size_t k = 0; k < frame_size; ++k) {
+          height_map_input[write_index++] = clip5(frame_data[k]);
+        }
+      }
+      return true;
+    }
+
+    bool build_residual_input_vector() {
+      if (!residual_engine_ || !encoder_engine_) {
+        return false;
+      }
+      TPinnedVector<float>& obs_input = residual_engine_->get_obs_dict_buffer();
+      TPinnedVector<float>& decoder_history_input = residual_engine_->get_decoder_history_buffer();
+      TPinnedVector<float>& height_map_input = residual_engine_->get_height_map_buffer();
+      auto registry = GetObservationRegistry();
+      size_t obs_write_index = 0;
+      size_t decoder_history_write_index = 0;
+      size_t height_write_index = 0;
+
+      auto& encoder_tokens = encoder_engine_->GetTokenBuffer();
+      const size_t token_dimension = encoder_engine_->GetTokenDimension();
+      for (size_t i = 0; i < token_dimension; ++i) {
+        obs_input[obs_write_index++] = encoder_tokens[i];
+      }
+      for (size_t i = 0; i < last_delta_z_time_series_.size(); ++i) {
+        obs_input[obs_write_index++] = last_delta_z_time_series_[i];
+      }
+      if (!copy_named_observation_to_float_buffer("his_base_angular_velocity_10frame_step1", registry, obs_input, obs_write_index)) { return false; }
+      if (!copy_named_observation_to_float_buffer("his_body_joint_positions_10frame_step1",  registry, obs_input, obs_write_index)) { return false; }
+      if (!copy_named_observation_to_float_buffer("his_body_joint_velocities_10frame_step1", registry, obs_input, obs_write_index)) { return false; }
+      if (!copy_named_observation_to_float_buffer("his_last_actions_10frame_step1",          registry, obs_input, obs_write_index)) { return false; }
+      if (!copy_named_observation_to_float_buffer("his_gravity_dir_10frame_step1",           registry, obs_input, obs_write_index)) { return false; }
+
+      if (!copy_named_observation_to_float_buffer("his_base_angular_velocity_10frame_step1", registry, decoder_history_input, decoder_history_write_index)) { return false; }
+      if (!copy_named_observation_to_float_buffer("his_body_joint_positions_10frame_step1",  registry, decoder_history_input, decoder_history_write_index)) { return false; }
+      if (!copy_named_observation_to_float_buffer("his_body_joint_velocities_10frame_step1", registry, decoder_history_input, decoder_history_write_index)) { return false; }
+      if (!copy_named_observation_to_float_buffer("his_last_actions_10frame_step1",          registry, decoder_history_input, decoder_history_write_index)) { return false; }
+      if (!copy_named_observation_to_float_buffer("his_gravity_dir_10frame_step1",           registry, decoder_history_input, decoder_history_write_index)) { return false; }
+
+      if (!fill_height_map_history_buffer(height_map_input, height_write_index)) {
+        return false;
+      }
+
+      return obs_write_index == residual_engine_->get_obs_dict_element_count() &&
+             decoder_history_write_index == residual_engine_->get_decoder_history_element_count() &&
+             height_write_index == residual_engine_->get_height_map_element_count();
+    }
+
+    bool run_residual_correction() {
+      if (!residual_stack_enabled_ || !residual_engine_) {
+        return false;
+      }
+      // Match Intentele: only push a new height-map frame every
+      // height_map_refresh_interval control ticks; other ticks reuse history.
+      const bool should_refresh_height_map =
+          (height_map_refresh_step_counter_ % residual_config_.height_map_refresh_interval) == 0;
+      height_map_refresh_step_counter_ += 1;
+      if (should_refresh_height_map) {
+        std::vector<float> newest_elevation_frame;
+#if HAS_ROS2
+        const bool got_elevation =
+            elevation_cache_ &&
+            elevation_cache_->try_copy_latest_elevation_row_major(newest_elevation_frame);
+        // Only push when a real frame arrived; otherwise keep previous history
+        // instead of flooding the CNN input with zeros.
+        if (got_elevation) {
+          shift_push_height_scanner_time_series(newest_elevation_frame);
+        }
+#else
+        newest_elevation_frame.assign(
+            static_cast<size_t>(residual_config_.height_scanner_row_count *
+                                residual_config_.height_scanner_column_count),
+            0.0f);
+        shift_push_height_scanner_time_series(newest_elevation_frame);
+#endif
+      }
+
+      if (!build_residual_input_vector()) {
+        return false;
+      }
+
+      if (!residual_engine_->infer()) {
+        return false;
+      }
+      auto& delta_token_buffer = residual_engine_->get_delta_token_buffer();
+      const size_t token_dimension = token_state_data_.size();
+      std::vector<float> newest_delta_step(static_cast<size_t>(residual_config_.last_delta_z_step_dimension));
+      float l2_sq = 0.0f;
+      size_t sat_count = 0;
+      for (size_t i = 0; i < token_dimension; ++i) {
+        float delta_value = (i < delta_token_buffer.size()) ? delta_token_buffer[i] : 0.0f;
+        if (!std::isfinite(delta_value)) {
+          delta_value = 0.0f;
+        }
+        const float scaled_delta = delta_value * kResidualTokenScale;
+        // const float scaled_delta = delta_value * 0.0;
+        token_state_data_[i] = std::clamp(
+            static_cast<float>(token_state_data_[i]) + scaled_delta, -1.0f, 0.975f);
+        const float token_value = static_cast<float>(token_state_data_[i]);
+        l2_sq += token_value * token_value;
+        if (std::abs(token_value) > 0.9f) {
+          ++sat_count;
+        }
+        if (i < newest_delta_step.size()) {
+          newest_delta_step[i] = delta_value;
+        }
+      }
+      // const float token_l2 = std::sqrt(l2_sq);
+      // const float token_sat = token_dimension > 0
+      //     ? static_cast<float>(sat_count) / static_cast<float>(token_dimension)
+      //     : 0.0f;
+      // std::printf("[Deploy] token L2: %.4f, sat: %.2f\n", token_l2, token_sat);
+      for (size_t i = token_dimension; i < newest_delta_step.size(); ++i) {
+        newest_delta_step[i] = 0.0f;
+      }
+      shift_push_last_delta_z_time_series(newest_delta_step);
+      return true;
+    }
+
     /// Populate the token_state observation (either from local encoder or external data).
     bool GatherTokenState(std::vector<double>& target_buffer, size_t offset) {
       if (!is_using_encoder_) {
@@ -1677,10 +1903,18 @@ class G1Deploy {
       }
       
       for (size_t i = 0; i < token_dim; ++i) {
-        const double v = static_cast<double>(token_buffer[i]);
-        token_state_data_[i] = v;
-        target_buffer[offset + i] = v;
+        token_state_data_[i] = static_cast<double>(token_buffer[i]);
       }
+      // After encoder: optional residual correction for locomotion / ZMQManager /
+      // keyboard paths.  Runtime toggle is Y/y on the active input interface.
+      const bool residual_runtime_on =
+          input_interface_ && input_interface_->IsResidualCorrectionEnabled();
+      if (residual_stack_enabled_ && residual_runtime_on) {
+        if (!run_residual_correction()) {
+          // Keep encoder-only tokens when residual fails; run_residual_correction already logged.
+        }
+      }
+      std::copy(token_state_data_.begin(), token_state_data_.end(), target_buffer.begin() + offset);
       return true;
     }
 
@@ -2096,6 +2330,16 @@ class G1Deploy {
           for (size_t i = 0; i < encoder_input_buffer.size() && i < encoder_obs_buffer_.size(); ++i) {
             encoder_input_buffer[i] = static_cast<float>(encoder_obs_buffer_[i]);
           }
+
+          // Log encoder input observations to CSV (one row per tick)
+          if (encoder_obs_csv_.is_open()) {
+            static uint64_t enc_obs_row = 0;
+            encoder_obs_csv_ << enc_obs_row++;
+            for (size_t i = 0; i < encoder_obs_buffer_.size(); ++i) {
+              encoder_obs_csv_ << "," << encoder_obs_buffer_[i];
+            }
+            encoder_obs_csv_ << "\n";
+          }
           
           // Warn if we had to switch from intended mode
           if (current_motion_->GetEncodeMode() != intended_encoder_mode && attempt > 0) {
@@ -2156,7 +2400,8 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      std::string residual_model_file_path = "")
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2174,6 +2419,7 @@ class G1Deploy {
         enable_motion_recording_(enable_motion_recording),
         initial_vr_3point_compliance_(initial_compliance),
         initial_max_close_ratio_(initial_max_close_ratio),
+        residual_model_file_path_argument_(std::move(residual_model_file_path)),
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
@@ -2326,7 +2572,8 @@ class G1Deploy {
       
       obs_config_ = full_obs_config.observations;
       encoder_config_ = full_obs_config.encoder;
-      
+      residual_config_ = full_obs_config.residual;
+
       // Initialize token buffer size from encoder config
       if (encoder_config_.dimension > 0) {
         token_state_data_.resize(encoder_config_.dimension, 0.0);
@@ -2373,6 +2620,71 @@ class G1Deploy {
           initial_encoder_mode_ = -2;
         }
         is_using_encoder_ = false;
+      }
+
+      // =========================================================================
+      // Optional residual network (between encoder and decoder)
+      // =========================================================================
+      if (residual_config_.enabled) {
+        if (residual_model_file_path_argument_.empty()) {
+          std::cout << "[Residual] YAML enabled residual but no --residual-model path; disabling residual stack."
+                    << std::endl;
+          residual_config_.enabled = false;
+        } else if (!is_using_encoder_) {
+          std::cout << "[Residual] Local encoder is required for the residual stack; disabling residual." << std::endl;
+          residual_config_.enabled = false;
+        } else if (residual_config_.height_scanner_row_count <= 0 || residual_config_.height_scanner_column_count <= 0) {
+          std::cout << "[Residual] Invalid height_scanner_row_count / height_scanner_column_count; disabling residual."
+                    << std::endl;
+          residual_config_.enabled = false;
+        } else if (residual_config_.last_delta_z_step_dimension <= 0) {
+          std::cout << "[Residual] Invalid last_delta_z_step_dimension; disabling residual." << std::endl;
+          residual_config_.enabled = false;
+        }
+      }
+      if (residual_config_.enabled) {
+        const size_t expected_obs_dict = compute_expected_obs_dict_element_count();
+        const size_t expected_decoder_history = compute_expected_decoder_history_element_count();
+        const size_t expected_height_map = compute_expected_height_map_element_count();
+        residual_engine_ = std::make_unique<ResidualEngine>();
+        if (!residual_engine_->initialize(residual_model_file_path_argument_, residual_config_.use_fp16)) {
+          throw std::runtime_error("Failed to initialize residual engine from: " + residual_model_file_path_argument_);
+        }
+        if (residual_engine_->get_obs_dict_element_count() != expected_obs_dict) {
+          throw std::runtime_error(
+              "Residual ONNX obs element count mismatch: model has " +
+              std::to_string(residual_engine_->get_obs_dict_element_count()) + " but configuration expects " +
+              std::to_string(expected_obs_dict));
+        }
+        if (residual_engine_->get_decoder_history_element_count() != expected_decoder_history) {
+          throw std::runtime_error(
+              "Residual ONNX decoder_history element count mismatch: model has " +
+              std::to_string(residual_engine_->get_decoder_history_element_count()) +
+              " but configuration expects " + std::to_string(expected_decoder_history));
+        }
+        if (residual_engine_->get_height_map_element_count() != expected_height_map) {
+          throw std::runtime_error(
+              "Residual ONNX height map element count mismatch: model has " +
+              std::to_string(residual_engine_->get_height_map_element_count()) +
+              " but configuration expects " + std::to_string(expected_height_map));
+        }
+        if (residual_engine_->get_output_element_count() != encoder_engine_->GetTokenDimension()) {
+          throw std::runtime_error(
+              "Residual ONNX output element count must match token dimension: model output " +
+              std::to_string(residual_engine_->get_output_element_count()) + " vs encoder " +
+              std::to_string(encoder_engine_->GetTokenDimension()));
+        }
+        const size_t height_cell_count = static_cast<size_t>(residual_config_.height_scanner_row_count) *
+                                         static_cast<size_t>(residual_config_.height_scanner_column_count);
+        last_delta_z_time_series_.assign(
+            static_cast<size_t>(kResidualHistoryStepCount) * static_cast<size_t>(residual_config_.last_delta_z_step_dimension),
+            0.0f);
+        height_scanner_time_series_.assign(
+            static_cast<size_t>(residual_config_.height_scanner_history_steps) * height_cell_count, 0.0f);
+        residual_stack_enabled_ = true;
+        std::cout << "✓ Residual stack enabled (model: " << residual_model_file_path_argument_ << ")" << std::endl;
+        std::cout << "  Token update: token_state += residual_output * " << kResidualTokenScale << std::endl;
+        std::cout << "  Keyboard: Y/y toggles residual correction at runtime (default: ENABLED)" << std::endl;
       }
       
       // =========================================================================
@@ -2431,6 +2743,8 @@ class G1Deploy {
       robot_config["is_using_encoder"] = is_using_encoder_;
       robot_config["policy_fp16"] = policy_fp16;
       robot_config["planner_fp16"] = planner_fp16;
+      robot_config["residual_enabled"] = residual_stack_enabled_;
+      robot_config["residual_model_file"] = residual_model_file_path_argument_.empty() ? "none" : residual_model_file_path_argument_;
 
       // Initialize state logger with complete robot configuration
       try {
@@ -2442,6 +2756,23 @@ class G1Deploy {
         std::cerr << "[ERROR] Failed to initialize state logger: " << e.what() << std::endl;
         std::cerr << "State logger is required for operation. Exiting..." << std::endl;
         throw;  // Re-throw to stop program initialization
+      }
+
+      // Open encoder observation CSV (same directory as other log files)
+      // Only create the file when CSV logging is enabled and encoder is in use
+      if (enable_csv_logs && is_using_encoder_) {
+        std::string enc_obs_path = state_logger_->GetCsvPath() + "/encoder_obs.csv";
+        encoder_obs_csv_.open(enc_obs_path, std::ios::out | std::ios::trunc);
+        if (encoder_obs_csv_.good()) {
+          // Write header: one column per encoder input dimension
+          const size_t dim = encoder_engine_->GetInputDimension();
+          encoder_obs_csv_ << "index";
+          for (size_t i = 0; i < dim; ++i) { encoder_obs_csv_ << ",enc_obs_" << i; }
+          encoder_obs_csv_ << "\n";
+          std::cout << "✓ Encoder obs CSV opened: " << enc_obs_path << " (dim=" << dim << ")" << std::endl;
+        } else {
+          std::cerr << "⚠ Warning: Failed to open encoder obs CSV: " << enc_obs_path << std::endl;
+        }
       }
 
       // Initialize input interface based on type
@@ -2463,7 +2794,7 @@ class G1Deploy {
         input_interface_ = std::make_unique<InterfaceManager>(
           zmq_host, zmq_port, zmq_topic, zmq_conflate, zmq_verbose
         );
-        std::cout << "Initialized interface manager (Shift+1/2/3/4 [! @ # $] to switch: keyboard, gamepad, zmq"
+        std::cout << "Initialized interface manager (Shift+1/2/3/4 [! @ # $] to switch: keyboard, gamepad, zmq_manager"
 #if HAS_ROS2
                   " , ros2"
 #endif
@@ -2509,6 +2840,17 @@ class G1Deploy {
         std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
       }
 
+#if HAS_ROS2
+      // Start the dedicated elevation-ingest thread whenever the residual stack
+      // is enabled, regardless of which --input-type the operator chose.
+      if (residual_stack_enabled_) {
+        elevation_cache_ = std::make_unique<Ros2ElevationCache>(
+            kResidualElevationMapTopic,
+            residual_config_.height_scanner_row_count,
+            residual_config_.height_scanner_column_count);
+      }
+#endif
+
       // Set initial VR 3-point compliance values for all input interfaces
       // These are keyboard-controlled: g/h for left hand, b/v for right hand
       if (input_interface_) {
@@ -2524,7 +2866,11 @@ class G1Deploy {
                   << " (1.0 = full closure allowed, 0.2 = limited)" << std::endl;
         std::cout << "[INFO] Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1 (range: 0.01-0.5)" << std::endl;
         std::cout << "[INFO] Keyboard controls: x/c = hand max close ratio +/- 0.1 (range: 0.2-1.0)" << std::endl;
-        
+        if (residual_stack_enabled_) {
+          input_interface_->SetResidualCorrectionEnabled(true);
+          std::cout << "[INFO] Keyboard controls: Y/y = toggle residual correction "
+                       "(token += residual * " << kResidualTokenScale << ")" << std::endl;
+        }
         // Info message about compliance observation status
         if (!has_vr_3point_compliance_obs_) {
           std::cout << "\n┌─────────────────────────────────────────────────────────────────────────────┐" << std::endl;
@@ -2695,6 +3041,16 @@ class G1Deploy {
           planner_thread_ptr_.reset();
         }
       }
+
+#if HAS_ROS2
+      // Stop the elevation-ingest thread after all control threads have exited
+      // so there is no concurrent access to the cache during teardown.
+      if (elevation_cache_) {
+        elevation_cache_->stop();
+        elevation_cache_.reset();
+      }
+#endif
+
       CreateDampingCommand();
       LowCommandWriter();
       std::cout << "Stop" << std::endl;
@@ -4092,6 +4448,13 @@ class G1Deploy {
  */
 int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program starting..." << std::endl;
+#if HAS_ROS2
+  // Initialize ROS2 once for the whole process (elevation cache, optional I/O handlers).
+  if (!rclcpp::ok()) {
+    rclcpp::init(argc, const_cast<char**>(argv));
+    std::cout << "[INFO] rclcpp initialized (HAS_ROS2=1)" << std::endl;
+  }
+#endif
   if (argc < 4) {
     std::cout << "Usage: " << argv[0] << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
               << std::endl;
@@ -4156,6 +4519,7 @@ int main(int argc, char const* argv[]) {
   bool disableCrcCheck = false;\
   std::string obsConfigPath = "";
   std::string encoderFile = "";
+  std::string residualModelFile = "";
   std::string targetMotionLogfile = "";
   std::string plannerMotionLogfile = "";
   std::string policyInputLogfile = "";
@@ -4197,6 +4561,15 @@ int main(int argc, char const* argv[]) {
         i++; // Skip the next argument since it's the encoder file path
       } else {
         std::cerr << "Error: --encoder-file requires a path argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--residual-model") {
+      if (i + 1 < argc) {
+        residualModelFile = argv[i + 1];
+        std::cout << "[INFO] Using residual model file: " << residualModelFile << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --residual-model requires a path argument" << std::endl;
         exit(1);
       }
     } else if (std::string(argv[i]) == "--planner-file") {
@@ -4438,7 +4811,8 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    residualModelFile
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
@@ -4462,6 +4836,11 @@ int main(int argc, char const* argv[]) {
   custom.Stop();
   std::cout << "[DEBUG] Waiting for cleanup..." << std::endl;
   sleep(0.5);
+#if HAS_ROS2
+  if (rclcpp::ok()) {
+    rclcpp::shutdown();
+  }
+#endif
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }

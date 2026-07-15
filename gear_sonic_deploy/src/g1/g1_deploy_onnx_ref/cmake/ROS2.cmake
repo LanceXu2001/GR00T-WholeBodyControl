@@ -55,6 +55,8 @@ list(REMOVE_DUPLICATES ROS2_INCLUDE_DIRS)
 
 # Essential ROS2 libraries for basic pub/sub functionality
 set(ESSENTIAL_LIB_PATTERNS
+  "libgrid_map_msgs__rosidl_typesupport_cpp.so*"
+  "libgrid_map_msgs__rosidl_generator_cpp.so*"
   "librclcpp.so*" "librcl.so*" "librcl_yaml_param_parser.so*"
   "librcpputils.so*" "librcutils.so*" "librmw.so*"
   "librmw_implementation.so*" "librmw_fastrtps_cpp.so*"

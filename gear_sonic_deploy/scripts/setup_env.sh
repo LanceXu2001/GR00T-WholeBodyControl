@@ -121,39 +121,56 @@ export CMAKE_PREFIX_PATH="$CMAKE_PATHS:$CMAKE_PREFIX_PATH"
 export OPENSSL_ROOT_DIR="/usr"
 
 # ROS2 Environment Setup - dynamically find ROS2 installation
-ROS2_FOUND=false
+# Check if ROS2 is explicitly disabled via environment variable
+if [ "${HAS_ROS2:-}" = "0" ]; then
+    echo "ℹ️  ROS2 is disabled via HAS_ROS2=0 - skipping ROS2 setup"
+    export HAS_ROS2=0
+else
+    ROS2_FOUND=false
 
-# Common ROS2 distributions in order of preference (newest first)
-ROS2_DISTROS=("jazzy" "iron" "humble" "galactic" "foxy" "eloquent" "dashing" "crystal")
-ROS2_INSTALL_PATHS=("/opt/ros" "/usr/local/ros" "$HOME/ros2_ws/install")
+    # Common ROS2 distributions in order of preference (newest first)
+    ROS2_DISTROS=("jazzy" "iron" "humble" "galactic" "foxy" "eloquent" "dashing" "crystal")
+    ROS2_INSTALL_PATHS=("/opt/ros" "/usr/local/ros" "$HOME/ros2_ws/install")
 
-for install_path in "${ROS2_INSTALL_PATHS[@]}"; do
-    if [ "$ROS2_FOUND" = true ]; then
-        break
-    fi
-    
-    for distro in "${ROS2_DISTROS[@]}"; do
-        ros2_setup_file="$install_path/$distro/setup.bash"
-        if [ -f "$ros2_setup_file" ]; then
-            source "$ros2_setup_file"
-            export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-            # Remove problematic system library path that conflicts with system GLIBC
-            export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v "$SYSTEM_LIB_DIR" | tr '\n' ':' | sed 's/:$//')
-            echo "✅ ROS2 $distro found at $install_path/$distro - system manages all ROS2 dependencies"
-            export HAS_ROS2=1
-            export ROS_LOCALHOST_ONLY=1
-            ROS2_FOUND=true
+    for install_path in "${ROS2_INSTALL_PATHS[@]}"; do
+        if [ "$ROS2_FOUND" = true ]; then
             break
         fi
+        
+        for distro in "${ROS2_DISTROS[@]}"; do
+            ros2_setup_file="$install_path/$distro/setup.bash"
+            if [ -f "$ros2_setup_file" ]; then
+                # Try to source ROS2 setup, but catch errors gracefully
+                # This prevents pkg_resources errors in conda environments
+                if (set +e; source "$ros2_setup_file" 2>&1); then
+                    export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+                    # Remove problematic system library path that conflicts with system GLIBC
+                    export LD_LIBRARY_PATH=$(echo $LD_LIBRARY_PATH | tr ':' '\n' | grep -v "$SYSTEM_LIB_DIR" | tr '\n' ':' | sed 's/:$//')
+                    echo "✅ ROS2 $distro found at $install_path/$distro - system manages all ROS2 dependencies"
+                    export HAS_ROS2=1
+                    # Do NOT force ROS_LOCALHOST_ONLY=1: MuJoCo sim / ros2 CLI often run
+                    # without it; mismatched localhost-only partitions hide deploy subscribers
+                    # from sim publishers (subscription count stays 0 on /elevation_map).
+                    unset ROS_LOCALHOST_ONLY
+                    ROS2_FOUND=true
+                    break
+                else
+                    echo "⚠️  ROS2 $distro found but setup.bash failed to source (may have dependency issues)"
+                    echo "   Continuing without ROS2 support..."
+                    ROS2_FOUND=false
+                    break
+                fi
+            fi
+        done
     done
-done
 
-if [ "$ROS2_FOUND" = false ]; then
-    echo "⚠️  ROS2 not found in common locations:"
-    printf "   %s/<distro>\n" "${ROS2_INSTALL_PATHS[@]}"
-    echo "   Install ROS2 system-wide for ROS2InputHandler support"
-    echo "   Building will continue without ROS2InputHandler"
-    export HAS_ROS2=0
+    if [ "$ROS2_FOUND" = false ]; then
+        echo "⚠️  ROS2 not found in common locations:"
+        printf "   %s/<distro>\n" "${ROS2_INSTALL_PATHS[@]}"
+        echo "   Install ROS2 system-wide for ROS2InputHandler support"
+        echo "   Building will continue without ROS2InputHandler"
+        export HAS_ROS2=0
+    fi
 fi
 
 # Set up production FastRTPS profile
@@ -300,6 +317,29 @@ fi
 if [ -d "/opt/onnxruntime/lib" ]; then
     export LD_LIBRARY_PATH="/opt/onnxruntime/lib:$LD_LIBRARY_PATH"
 fi
+
+# Add Unitree SDK2 DDS libraries to LD_LIBRARY_PATH
+# These are required for runtime (libddsc.so and libddscxx.so)
+# The DDS libraries are located in thirdparty/unitree_sdk2/thirdparty/lib/${ARCH}/
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ARCH=$(uname -m)
+
+# Detect DDS library path
+DDS_LIB_PATH="${PROJECT_ROOT}/thirdparty/unitree_sdk2/thirdparty/lib/${ARCH}"
+
+if [ -d "$DDS_LIB_PATH" ] && [ -f "$DDS_LIB_PATH/libddsc.so" ]; then
+    export LD_LIBRARY_PATH="$DDS_LIB_PATH:$LD_LIBRARY_PATH"
+    echo "✅ Added Unitree SDK2 DDS libraries to LD_LIBRARY_PATH: $DDS_LIB_PATH"
+else
+    echo "⚠️  DDS libraries not found at: $DDS_LIB_PATH"
+    echo "   This may cause runtime errors if using Unitree SDK2 features"
+    echo "   Expected files: libddsc.so, libddscxx.so"
+fi
+
+# Verify essential tools
+echo ""
+echo "🔍 Verifying essential tools:"
 
 # Set up Git LFS (if not already done)
 if command -v git-lfs &> /dev/null; then

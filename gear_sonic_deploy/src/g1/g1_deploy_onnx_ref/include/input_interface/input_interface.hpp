@@ -279,6 +279,27 @@ public:
                   << " (range: 0.2-1.0, higher = more closed)" << std::endl;
     }
 
+    // =========================================================================
+    // Residual correction runtime toggle (keyboard Y/y)
+    // When the residual stack is loaded, GatherTokenState adds
+    // delta_token * 0.2 to encoder tokens before the decoder.  This flag lets
+    // the operator enable/disable that correction without restarting.
+    // =========================================================================
+
+    virtual bool IsResidualCorrectionEnabled() const {
+        return residual_correction_enabled_.load(std::memory_order_relaxed);
+    }
+
+    virtual void SetResidualCorrectionEnabled(bool enabled) {
+        residual_correction_enabled_.store(enabled, std::memory_order_relaxed);
+        std::cout << "[InputInterface] Residual correction: "
+                  << (enabled ? "ENABLED" : "DISABLED") << std::endl;
+    }
+
+    virtual void ToggleResidualCorrection() {
+        SetResidualCorrectionEnabled(!IsResidualCorrectionEnabled());
+    }
+
     // ------------------------------------------------------------------
     // VR 5-point tracking (3-point + 2 extra body trackers)
     // Layout: [left_wrist, right_wrist, head, tracker1, tracker2] × xyz
@@ -496,6 +517,10 @@ protected:
     /// Adjusted via keyboard (X = +0.1, C = −0.1), clamped to [0.2, 1.0].
     /// 1.0 = fully closed allowed (default); use --max-close-ratio CLI arg to limit.
     std::atomic<double> max_close_ratio_{1.0};
+
+    /// Runtime enable for residual correction after the encoder (Y/y toggle).
+    /// Default true so a loaded residual stack is active until the operator disables it.
+    std::atomic<bool> residual_correction_enabled_{true};
 
     /// Shared stdin buffer – the InterfaceManager pushes non-manager keys here
     /// for the currently-active interface to consume via ReadStdinChar().

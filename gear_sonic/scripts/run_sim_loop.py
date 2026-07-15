@@ -37,6 +37,34 @@ def main(config: ArgsConfig):
     wbc_config = config.load_wbc_yaml()
     # NOTE: we will override the interface to local if it is not specified
     wbc_config["ENV_NAME"] = config.env_name
+    wbc_config["ENABLE_ROS2_JOINT_STATE"] = config.enable_ros2_joint_state
+    wbc_config["ROS2_JOINT_STATE_TOPIC"] = config.ros2_joint_state_topic
+    wbc_config["ROS2_JOINT_STATE_RATE_HZ"] = config.ros2_joint_state_rate_hz
+    wbc_config["ENABLE_ROS2_TF"] = config.enable_ros2_tf
+    wbc_config["ROS2_TF_PARENT_FRAME_ID"] = config.ros2_tf_parent_frame_id
+    wbc_config["ROS2_TF_CHILD_FRAME_ID"] = config.ros2_tf_child_frame_id
+    wbc_config["ROS2_TF_BODY_NAME"] = config.ros2_tf_body_name
+    wbc_config["ROS2_TF_RATE_HZ"] = config.ros2_tf_rate_hz
+    wbc_config["ENABLE_ROS2_ELEVATION_MAP"] = config.enable_ros2_elevation_map
+    wbc_config["ROS2_ELEVATION_MAP_TOPIC"] = config.ros2_elevation_map_topic
+    wbc_config["ROS2_ELEVATION_MAP_BODY_NAME"] = config.ros2_elevation_map_body_name
+    wbc_config["ROS2_ELEVATION_MAP_RATE_HZ"] = config.ros2_elevation_map_rate_hz
+    wbc_config["ROS2_ELEVATION_MAP_TERRAIN_GEOM_GROUP"] = (
+        config.ros2_elevation_map_terrain_geom_group
+    )
+    wbc_config["SHOW_ELEVATION_VIEWER_MARKERS"] = config.show_elevation_viewer_markers
+    wbc_config["ENABLE_ROS2_LIDAR_POINTCLOUD"] = config.enable_ros2_lidar_pointcloud
+    wbc_config["ROS2_LIDAR_POINTCLOUD_TOPIC"] = config.ros2_lidar_pointcloud_topic
+    wbc_config["ROS2_LIDAR_POINTCLOUD_RATE_HZ"] = config.ros2_lidar_pointcloud_rate_hz
+    wbc_config["LIDAR_SITE_NAME"] = config.lidar_site_name
+    wbc_config["LIDAR_SCAN_TYPE"] = config.lidar_scan_type
+    wbc_config["LIDAR_BACKEND"] = config.lidar_backend
+    wbc_config["ENABLE_ROS2_BODY_STATE"] = config.enable_ros2_body_state
+    wbc_config["ROS2_BODY_STATE_TOPIC_PREFIX"] = config.ros2_body_state_topic_prefix
+    wbc_config["ROS2_BODY_STATE_RATE_HZ"] = config.ros2_body_state_rate_hz
+    wbc_config["ENABLE_ROS2_SIM_RESET"] = config.enable_ros2_sim_reset
+    wbc_config["ROS2_SIM_RESET_TOPIC"] = config.ros2_sim_reset_topic
+    wbc_config["ROS2_RELEASE_BAND_TOPIC"] = config.ros2_release_band_topic
 
     if config.enable_image_publish:
         assert (

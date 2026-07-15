@@ -41,6 +41,7 @@ sim = [
     "tyro",
     "pin",
     "pyyaml",
+    "mujoco-lidar",
 ]
 
 [tool.setuptools.packages.find]

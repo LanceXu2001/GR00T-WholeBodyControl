@@ -187,6 +187,9 @@ class StateLogger {
   size_t capacity() const;
   size_t size() const;
 
+  // Returns the directory where CSV files are written (empty if CSV disabled)
+  std::string GetCsvPath() const { return csv_path_; }
+
   // Returns copies of the latest n entries (up to available size)
   // If newest_first is true (default), returns [newest, ..., oldest]; otherwise [oldest, ..., newest]
   std::vector<Entry> GetLatest(size_t n, bool newest_first = true) const;

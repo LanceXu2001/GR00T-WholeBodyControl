@@ -136,6 +136,81 @@ if(NOT ZMQ_INCLUDE_DIR OR NOT ZMQ_LIBRARY)
   message(FATAL_ERROR "❌ libzmq is required but not found. Please install libzmq-dev (apt) or zeromq (brew)")
 endif()
 
+# Find cppzmq (zmq.hpp) - prefer third_party version (newer API)
+set(CPPZMQ_INCLUDE_DIR "")
+
+# Use CMAKE_SOURCE_DIR (project root) instead of relative path
+# CMAKE_SOURCE_DIR points to gear_sonic_deploy/
+set(CPPZMQ_DIR "${CMAKE_SOURCE_DIR}/third_party/cppzmq")
+
+# Debug: Print the path we're checking
+message(STATUS "🔍 Checking for cppzmq at: ${CPPZMQ_DIR}")
+message(STATUS "   CMAKE_SOURCE_DIR: ${CMAKE_SOURCE_DIR}")
+message(STATUS "   CMAKE_CURRENT_SOURCE_DIR: ${CMAKE_CURRENT_SOURCE_DIR}")
+
+# Convert to absolute path for reliability
+get_filename_component(CPPZMQ_DIR_ABS "${CPPZMQ_DIR}" ABSOLUTE)
+
+if(EXISTS "${CPPZMQ_DIR_ABS}/zmq.hpp")
+  set(CPPZMQ_INCLUDE_DIR "${CPPZMQ_DIR_ABS}")
+  message(STATUS "✅ Using cppzmq 4.x+ from third_party: ${CPPZMQ_INCLUDE_DIR}")
+  
+  # Verify it's actually 4.x+ by checking for sockopt namespace
+  file(READ "${CPPZMQ_INCLUDE_DIR}/zmq.hpp" CPPZMQ_CONTENT)
+  if(CPPZMQ_CONTENT MATCHES "namespace sockopt")
+    message(STATUS "✅ Verified: cppzmq 4.x+ API confirmed")
+  else()
+    message(WARNING "⚠️  third_party/cppzmq may be old version")
+  endif()
+else()
+  message(WARNING "⚠️  third_party/cppzmq not found at ${CPPZMQ_DIR_ABS}")
+  message(STATUS "   Expected path: ${CPPZMQ_DIR_ABS}/zmq.hpp")
+  
+  # Fallback: check system installation
+  if(EXISTS "/usr/include/zmq.hpp")
+    message(STATUS "🔍 Checking system cppzmq at /usr/include/zmq.hpp...")
+    # Verify it's 4.x+ by checking for sockopt
+    file(READ "/usr/include/zmq.hpp" ZMQ_HPP_CONTENT)
+    if(ZMQ_HPP_CONTENT MATCHES "namespace sockopt")
+      set(CPPZMQ_INCLUDE_DIR "/usr/include")
+      message(STATUS "✅ Using system cppzmq 4.x+: ${CPPZMQ_INCLUDE_DIR}")
+    else()
+      message(FATAL_ERROR "
+❌ System cppzmq is too old (< 4.x).
+
+To fix this, run:
+  cd ${CMAKE_SOURCE_DIR}
+  mkdir -p third_party
+  cd third_party
+  git clone --depth 1 https://github.com/zeromq/cppzmq.git
+
+Then re-run CMake configuration.
+")
+    endif()
+  else()
+    message(FATAL_ERROR "
+❌ cppzmq not found.
+
+To fix this, run:
+  cd ${CMAKE_SOURCE_DIR}
+  mkdir -p third_party
+  cd third_party
+  git clone --depth 1 https://github.com/zeromq/cppzmq.git
+
+Then re-run CMake configuration.
+")
+  endif()
+endif()
+
+# Ensure CPPZMQ_INCLUDE_DIR is set and is absolute
+if("${CPPZMQ_INCLUDE_DIR}" STREQUAL "")
+  message(FATAL_ERROR "❌ CPPZMQ_INCLUDE_DIR is empty! This should not happen.")
+endif()
+
+# Ensure it's an absolute path
+get_filename_component(CPPZMQ_INCLUDE_DIR "${CPPZMQ_INCLUDE_DIR}" ABSOLUTE)
+message(STATUS "📌 Final cppzmq include directory: ${CPPZMQ_INCLUDE_DIR}")
+
 # Add ZMQ to main executable
 message(STATUS "✅ ZMQ support enabled for main executable")
 
@@ -144,9 +219,11 @@ if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
   add_executable(zmq_pose_subscriber_test
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/zmq_pose_subscriber_test.cpp)
   target_include_directories(zmq_pose_subscriber_test PRIVATE
+    ${CPPZMQ_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${ZMQ_INCLUDE_DIR})
-  target_link_libraries(zmq_pose_subscriber_test PRIVATE ${ZMQ_LIBRARY})
+  target_link_libraries(zmq_pose_subscriber_test PRIVATE ${ZMQ_LIBRARY}
+   Threads::Threads)
   set_target_properties(zmq_pose_subscriber_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
     CXX_STANDARD 20
@@ -158,9 +235,11 @@ if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
   add_executable(zmq_python_sender_test
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/zmq_python_sender_test.cpp)
   target_include_directories(zmq_python_sender_test PRIVATE
+    ${CPPZMQ_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${ZMQ_INCLUDE_DIR})
-  target_link_libraries(zmq_python_sender_test PRIVATE ${ZMQ_LIBRARY})
+  target_link_libraries(zmq_python_sender_test PRIVATE ${ZMQ_LIBRARY}
+   Threads::Threads)
   set_target_properties(zmq_python_sender_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
     CXX_STANDARD 20
@@ -173,12 +252,18 @@ endif()
 
 find_package(Eigen3 REQUIRED)
 
+# set(EXE_INCLUDES
+#   ${CMAKE_CURRENT_SOURCE_DIR}/include/
+#   ${ZMQ_INCLUDE_DIR}
+#   ${EIGEN3_INCLUDE_DIR}
+# )
+# 修改 EXE_INCLUDES，添加 CPPZMQ_INCLUDE_DIR
 set(EXE_INCLUDES
   ${CMAKE_CURRENT_SOURCE_DIR}/include/
   ${ZMQ_INCLUDE_DIR}
+  ${CPPZMQ_INCLUDE_DIR}
   ${EIGEN3_INCLUDE_DIR}
 )
-
 
 # Build a static library, used by both the main executable and the tests: 
 add_library(g1_deploy_shared STATIC ${PROJECT_SRCS})
@@ -208,13 +293,26 @@ target_link_libraries(
 )
 
 # Setting our output directory and C++ standard
+# Output to target/debug or target/release based on build type
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(OUTPUT_DIR "${PROJECT_SOURCE_DIR}/target/debug/")
+else()
+  set(OUTPUT_DIR "${PROJECT_SOURCE_DIR}/target/release/")
+endif()
+
 set_target_properties(
   ${EXECUTABLE_NAME}
-  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${OUTPUT_DIR}"
              OUTPUT_NAME ${EXECUTABLE_NAME}
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              CXX_EXTENSIONS OFF)
+
+# Enable debug symbols and disable optimizations for Debug builds
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  target_compile_options(${EXECUTABLE_NAME} PRIVATE -g -O0)
+  target_link_options(${EXECUTABLE_NAME} PRIVATE -g)
+endif()
 
 # Optional ROS2 support for main executable and tests
 if(rclcpp_FOUND AND std_msgs_FOUND)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """AMASS motion ZMQ player.
 
-Publishes motion clips from gear_sonic_deploy/reference/motions/*.npz
+Publishes motion clips listed in intentele ``test_dataset.yaml``
 as a Pico-compatible ZMQ stream (protocol version 3, PUB socket port 5556).
 
 Required npz keys (same three keys as intentele ``MotionLibNPZ`` / ``prepare_dataset`` style):
@@ -18,11 +18,14 @@ Key bindings:
   R / r    restart current clip from frame 0
   N / n    next clip
   P / p    previous clip
-  Space    toggle planner / streamed pose (same bytes as Pico A+X on mode switch)
   Ctrl-C   quit
+
+Requires deploy with ``--input-type zmq_manager``.  T/R switch to streamed motion;
+each clip end switches back to planner (same as pressing Enter twice on controller).
 
 Usage (from repo root):
   python gear_sonic_deploy/amass_zmq_player.py
+  python gear_sonic_deploy/amass_zmq_player.py --target-fps 50   # uniform output timeline (default 50)
   python gear_sonic_deploy/amass_zmq_player.py --vis-smpl   # optional SMPL-24 skeleton window
   python gear_sonic_deploy/amass_zmq_player.py --root-orientation-disk-order wxyz   # if your npz stores scalar-first
 
@@ -32,6 +35,7 @@ Default ``--root-orientation-disk-order xyzw`` matches intentele ``motion_lib_sm
 from __future__ import annotations
 
 import argparse
+import atexit
 import pathlib
 import queue
 import sys
@@ -41,8 +45,22 @@ import time
 import tty
 from typing import List, Optional, Tuple
 
+# Allow running from gear_sonic_deploy/ without pip install -e gear_sonic/.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import numpy as np
-import zmq
+import yaml
+
+try:
+    import zmq
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError(
+        f"No module named 'zmq' (pyzmq) for interpreter {sys.executable}. "
+        "Activate the sonic env and run: pip install pyzmq scipy"
+    ) from exc
+
 from scipy.spatial.transform import Rotation
 
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -55,7 +73,11 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 # Fixed configuration (plan.md §2.1, §3.6)
 # ---------------------------------------------------------------------------
 
-MOTIONS_DIRECTORY = pathlib.Path(__file__).parent / "reference" / "motions"/ "Male2Walking_c3d"
+_DEFAULT_INTENTELE_ROOT = pathlib.Path("/data/XJL/project/intentele")
+DEFAULT_DATASET_YAML = (
+    _DEFAULT_INTENTELE_ROOT
+    / "source/intentele/intentele/tasks/intentele/assets/test_dataset.yaml"
+)
 ZMQ_PORT = 5556
 NUM_FRAMES_PER_PACKET = 5   # sub-frames batched into one ZMQ pose message
 JOINT_DOF = 29              # dimension of joint_pos / joint_vel
@@ -170,6 +192,69 @@ def _normalize_quaternion_rows_wxyz(quaternions_wxyz: np.ndarray) -> np.ndarray:
     return (rows / norms).astype(np.float32)
 
 
+def _interpolate_quaternion_wxyz_normalized_linear(
+    quaternion_wxyz_before: np.ndarray,
+    quaternion_wxyz_after: np.ndarray,
+    interpolation_alpha: float,
+) -> np.ndarray:
+    """Blend two WXYZ quaternions with normalized linear interpolation (same idea as Pico pose stream)."""
+    quaternion_xyzw_before = _wxyz_to_xyzw(np.asarray(quaternion_wxyz_before, dtype=np.float64).reshape(4))
+    quaternion_xyzw_after = _wxyz_to_xyzw(np.asarray(quaternion_wxyz_after, dtype=np.float64).reshape(4))
+    dot_product = float(np.dot(quaternion_xyzw_before, quaternion_xyzw_after))
+    if dot_product < 0.0:
+        quaternion_xyzw_after = -quaternion_xyzw_after
+    blended_xyzw = (1.0 - interpolation_alpha) * quaternion_xyzw_before + interpolation_alpha * quaternion_xyzw_after
+    norm = float(np.linalg.norm(blended_xyzw))
+    if norm > 1e-12:
+        blended_xyzw = blended_xyzw / norm
+    return _xyzw_to_wxyz(blended_xyzw).astype(np.float32)
+
+
+def interpolate_motion_clip_sample(
+    motion_clip: MotionClip,
+    continuous_clip_frame_index: float,
+    is_holding_first_frame: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return one SMPL sample (smpl_pose, smpl_joints, body_quat_w) for a fractional clip timeline."""
+    if is_holding_first_frame:
+        # 片段结束后：关节/姿态冻结在第 0 帧（与 plan §9 一致），根朝向保持最后一帧，
+        # 避免机器人“跟完动作”后航向被拉回第一帧。
+        pose_joints_index = 0
+        last_frame_index = motion_clip.num_frames - 1
+        return (
+            motion_clip.smpl_pose[pose_joints_index].copy(),
+            motion_clip.smpl_joints[pose_joints_index].copy(),
+            motion_clip.root_quaternion_heading_aligned_wxyz[last_frame_index].copy(),
+        )
+
+    number_of_frames = motion_clip.num_frames
+    if number_of_frames < 1:
+        raise ValueError("motion clip has no frames")
+
+    lower_frame_index = int(np.floor(float(continuous_clip_frame_index)))
+    upper_frame_index = int(np.minimum(lower_frame_index + 1, number_of_frames - 1))
+    interpolation_alpha = float(continuous_clip_frame_index) - float(lower_frame_index)
+    lower_frame_index = int(np.clip(lower_frame_index, 0, number_of_frames - 1))
+
+    smpl_joints_before = motion_clip.smpl_joints[lower_frame_index].astype(np.float32)
+    smpl_joints_after = motion_clip.smpl_joints[upper_frame_index].astype(np.float32)
+    interpolated_smpl_joints = (1.0 - interpolation_alpha) * smpl_joints_before + interpolation_alpha * smpl_joints_after
+
+    quaternion_before = motion_clip.root_quaternion_heading_aligned_wxyz[lower_frame_index]
+    quaternion_after = motion_clip.root_quaternion_heading_aligned_wxyz[upper_frame_index]
+    interpolated_body_quat_w = _interpolate_quaternion_wxyz_normalized_linear(
+        quaternion_before,
+        quaternion_after,
+        interpolation_alpha,
+    )
+
+    smpl_pose_before = motion_clip.smpl_pose[lower_frame_index].astype(np.float32)
+    smpl_pose_after = motion_clip.smpl_pose[upper_frame_index].astype(np.float32)
+    interpolated_smpl_pose = (1.0 - interpolation_alpha) * smpl_pose_before + interpolation_alpha * smpl_pose_after
+
+    return interpolated_smpl_pose, interpolated_smpl_joints, interpolated_body_quat_w
+
+
 # Identity ``heading_delta_quaternion`` (WXYZ): no robot — same as intentele with identity ``delta_q`` only.
 IDENTITY_QUATERNION_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
@@ -243,6 +328,7 @@ class MotionClip:
 def _precompute_clip(
     npz_path: pathlib.Path,
     root_orientation_disk_component_order: str,
+    clip_name: Optional[str] = None,
 ) -> MotionClip:
     """Load one .npz; build ``smpl_joints`` like intentele ``_apply_heading_alignment`` (identity delta_q)."""
     data = np.load(npz_path, allow_pickle=False)
@@ -282,8 +368,9 @@ def _precompute_clip(
 
     smpl_pose = np.zeros((joint_poses_world.shape[0], 21, 3), dtype=np.float32)
 
+    name = clip_name if clip_name is not None else npz_path.stem
     return MotionClip(
-        name=npz_path.stem,
+        name=name,
         clip_fps=clip_fps,
         smpl_joints=smpl_joints,
         smpl_pose=smpl_pose,
@@ -291,29 +378,56 @@ def _precompute_clip(
     )
 
 
-def load_all_clips(
-    motions_directory: pathlib.Path,
+def load_clips_from_dataset_yaml(
+    dataset_yaml: pathlib.Path,
+    intentele_root: pathlib.Path,
     root_orientation_disk_component_order: str,
 ) -> List[MotionClip]:
-    npz_files = sorted(motions_directory.glob("*.npz"))
-    if not npz_files:
-        raise RuntimeError(f"No .npz files found in {motions_directory}")
+    """Load npz clips listed in an intentele dataset yaml (e.g. test_dataset.yaml)."""
+    with open(dataset_yaml, "r") as yaml_file:
+        motion_config = yaml.safe_load(yaml_file)
 
-    clips = []
-    for npz_path in npz_files:
+    motion_root = intentele_root / motion_config["root_path"]
+    clips: List[MotionClip] = []
+    for motion_entry in motion_config["motions"]:
+        if not isinstance(motion_entry, dict) or "file" not in motion_entry:
+            continue
+        rel = motion_entry["file"]
+        if not str(rel).endswith(".npz"):
+            continue
+        npz_path = motion_root / rel
         try:
             clip = _precompute_clip(
                 npz_path,
                 root_orientation_disk_component_order=root_orientation_disk_component_order,
+                clip_name=rel,
             )
-            print(f"  loaded  {npz_path.name:<40}  {clip.num_frames} frames @ {clip.clip_fps} fps")
+            print(f"  loaded  {rel:<40}  {clip.num_frames} frames @ {clip.clip_fps} fps")
             clips.append(clip)
         except Exception as error:
-            print(f"  SKIP    {npz_path.name}: {error}")
+            print(f"  SKIP    {rel}: {error}")
 
     if not clips:
-        raise RuntimeError("No valid clips could be loaded.")
+        raise RuntimeError(f"No valid clips could be loaded from {dataset_yaml}.")
     return clips
+
+
+# ---------------------------------------------------------------------------
+# zmq_manager command sequencing
+# ---------------------------------------------------------------------------
+
+
+def _activate_control_and_streamed_motion(zmq_socket) -> None:
+    """Start policy in PLANNER mode first, then switch to STREAMED_MOTION.
+
+    zmq_manager only consumes ``start=True`` inside ``handlePlannerInput``.
+    A single command with ``planner=False`` switches mode in ``update()`` before
+    ``handle_input()`` runs, so ``start`` would be dropped.
+    """
+    zmq_socket.send(build_command_message(start=True, stop=False, planner=True))
+    zmq_socket.send(build_planner_message(0, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]))
+    time.sleep(0.2)
+    zmq_socket.send(build_command_message(start=True, stop=False, planner=False))
 
 
 # ---------------------------------------------------------------------------
@@ -321,18 +435,23 @@ def load_all_clips(
 # ---------------------------------------------------------------------------
 
 
-def _build_pose_packet(
-    clip: MotionClip,
-    clip_local_frame_indices: List[int],
+def _build_pose_packet_from_interpolated_batches(
+    smpl_pose_batch: np.ndarray,
+    smpl_joints_batch: np.ndarray,
+    body_quat_w_batch: np.ndarray,
     global_frame_indices: List[int],
 ) -> bytes:
-    batch_size = len(clip_local_frame_indices)
+    batch_size = int(smpl_pose_batch.shape[0])
+    if smpl_joints_batch.shape[0] != batch_size or body_quat_w_batch.shape[0] != batch_size:
+        raise ValueError("batch dimension mismatch for interpolated pose arrays")
+    if len(global_frame_indices) != batch_size:
+        raise ValueError("global_frame_indices length must match batch size")
     pose_data = {
-        "smpl_pose":   clip.smpl_pose[clip_local_frame_indices],                # [B, 21, 3]
-        "smpl_joints": clip.smpl_joints[clip_local_frame_indices],              # [B, 24, 3]
-        "body_quat_w": clip.root_quaternion_heading_aligned_wxyz[clip_local_frame_indices],  # [B, 4]
-        "joint_pos":   np.zeros((batch_size, JOINT_DOF), dtype=np.float32),
-        "joint_vel":   np.zeros((batch_size, JOINT_DOF), dtype=np.float32),
+        "smpl_pose": smpl_pose_batch.astype(np.float32, copy=False),
+        "smpl_joints": smpl_joints_batch.astype(np.float32, copy=False),
+        "body_quat_w": body_quat_w_batch.astype(np.float32, copy=False),
+        "joint_pos": np.zeros((batch_size, JOINT_DOF), dtype=np.float32),
+        "joint_vel": np.zeros((batch_size, JOINT_DOF), dtype=np.float32),
         "frame_index": np.array(global_frame_indices, dtype=np.int64),
     }
     return pack_pose_message(pose_data, topic="pose", version=3)
@@ -346,16 +465,21 @@ def _build_pose_packet(
 def _start_keyboard_reader() -> queue.SimpleQueue:
     key_queue: queue.SimpleQueue = queue.SimpleQueue()
 
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    # 守护线程退出时 finally 不会执行，用 atexit 保证终端设置始终被还原
+    atexit.register(termios.tcsetattr, fd, termios.TCSADRAIN, old_settings)
+
     def _reader() -> None:
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
         try:
-            tty.setraw(fd)
+            tty.setcbreak(fd)   # 只禁用 ICANON+ECHO，保留 OPOST，\n 仍正常转 \r\n
             while True:
                 character = sys.stdin.read(1)
                 if not character:
                     break
                 key_queue.put(character)
+        except Exception:
+            pass
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
@@ -373,30 +497,38 @@ def run_player(
     zmq_socket,
     smpl_skeleton_viewer: Optional[SimpleSmplSkeletonWindow] = None,
     visualization_interval_seconds: float = 1.0 / 30.0,
+    target_output_frames_per_second: float = 50.0,
 ) -> None:
+    if target_output_frames_per_second <= 0.0:
+        raise ValueError("target_output_frames_per_second must be > 0")
+
     # --- mutable state ---
     current_clip_index = 0
-    current_frame_index = 0
     is_streaming = False
     is_holding_first_frame = False   # True after clip ends; repeat frame 0 (§9)
     global_stream_frame_index = 0
-    next_send_time = time.monotonic()
+    next_output_deadline_monotonic = time.monotonic()
     previous_clip_index = 0
     last_skeleton_visualization_time = 0.0
+    continuous_clip_frame_index = 0.0
 
-    # buffers for building one packet
-    clip_local_frame_buffer: List[int] = []
+    # buffers for building one packet (interpolated rows, not integer clip indices)
+    smpl_pose_row_buffer: List[np.ndarray] = []
+    smpl_joints_row_buffer: List[np.ndarray] = []
+    body_quat_w_row_buffer: List[np.ndarray] = []
     global_frame_buffer: List[int] = []
 
-    key_queue = _start_keyboard_reader()
     clip = clips[current_clip_index]
+    output_period_seconds = 1.0 / float(target_output_frames_per_second)
 
-    print(f"\n{len(clips)} clip(s) loaded.  Current: {clip.name}  ({clip.clip_fps} fps)")
-    print("Keys:  T=play/resume  R=restart  N=next  P=prev  Space=planner/pose  Ctrl-C=quit\n")
+    # 在进入 raw 模式之前完成初始打印，避免 \n 不含 \r 导致的错位
+    print(f"\n{len(clips)} clip(s) loaded.  Current: {clip.name}  (clip {clip.clip_fps} fps)")
+    print(f"Output stream: {target_output_frames_per_second} Hz (interpolated along clip timeline)")
+    print("Keys:  T=play/resume  R=restart  N=next  P=prev  Ctrl-C=quit\n")
 
-    # Match pico_manager startup: streamed motion + one planner bootstrap frame.
-    receiver_planner_mode = False
-    zmq_socket.send(build_command_message(start=False, stop=False, planner=False))
+    key_queue = _start_keyboard_reader()
+
+    zmq_socket.send(build_command_message(start=True, stop=False, planner=True))
     zmq_socket.send(build_planner_message(0, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]))
 
     while True:
@@ -413,15 +545,21 @@ def run_player(
                 break
 
             elif key in ("t", "T"):
+                _activate_control_and_streamed_motion(zmq_socket)
                 is_streaming = True
                 is_holding_first_frame = False
-                next_send_time = time.monotonic()
-                print(f"  play  clip={clip.name}  frame={current_frame_index}")
+                continuous_clip_frame_index = 0.0
+                next_output_deadline_monotonic = time.monotonic()
+                print(f"  play  clip={clip.name}  continuous_frame_index=0")
 
             elif key in ("r", "R"):
-                current_frame_index = 0
+                _activate_control_and_streamed_motion(zmq_socket)
+                is_streaming = True
                 is_holding_first_frame = False
-                clip_local_frame_buffer.clear()
+                continuous_clip_frame_index = 0.0
+                smpl_pose_row_buffer.clear()
+                smpl_joints_row_buffer.clear()
+                body_quat_w_row_buffer.clear()
                 global_frame_buffer.clear()
                 print(f"  restart  clip={clip.name}")
 
@@ -431,82 +569,111 @@ def run_player(
             elif key in ("p", "P"):
                 current_clip_index = (current_clip_index - 1) % len(clips)
 
-            elif key == " ":
-                # Same as pico_manager A+X on edge: PLANNER<->POSE uses start=True, stop=False
-                # (see pico_manager_thread_server.py around socket.send(build_command_message(...))).
-                receiver_planner_mode = not receiver_planner_mode
-                zmq_socket.send(
-                    build_command_message(
-                        start=True,
-                        stop=False,
-                        planner=receiver_planner_mode,
-                    )
-                )
-                if receiver_planner_mode:
-                    zmq_socket.send(
-                        build_planner_message(0, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], -1.0, -1.0)
-                    )
-                mode_label = "planner" if receiver_planner_mode else "streamed pose (npz)"
-                print(f"  command toggle -> {mode_label}")
-
         if should_quit:
             break
 
         # ---- handle clip change (§8.2) ----
         if current_clip_index != previous_clip_index:
             clip = clips[current_clip_index]
-            current_frame_index = 0
             is_holding_first_frame = False
-            clip_local_frame_buffer.clear()
+            continuous_clip_frame_index = 0.0
+            smpl_pose_row_buffer.clear()
+            smpl_joints_row_buffer.clear()
+            body_quat_w_row_buffer.clear()
             global_frame_buffer.clear()
-            next_send_time = time.monotonic()
+            next_output_deadline_monotonic = time.monotonic()
             previous_clip_index = current_clip_index
             print(f"  switched to clip: {clip.name}  ({clip.clip_fps} fps)")
 
-        # ---- sleep until next sub-frame deadline (§3.6) ----
+        # ---- sleep until next output tick (uniform target_output_frames_per_second) ----
         if not is_streaming:
             time.sleep(0.02)  # ~50 Hz key polling when idle
             continue
 
-        sleep_seconds = next_send_time - time.monotonic()
+        sleep_seconds = next_output_deadline_monotonic - time.monotonic()
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
 
-        # ---- choose clip-local frame for this step ----
-        if is_holding_first_frame:
-            frame_for_this_step = 0
-        else:
-            frame_for_this_step = current_frame_index
+        interpolated_smpl_pose, interpolated_smpl_joints, interpolated_body_quat_w = (
+            interpolate_motion_clip_sample(
+                motion_clip=clip,
+                continuous_clip_frame_index=continuous_clip_frame_index,
+                is_holding_first_frame=is_holding_first_frame,
+            )
+        )
 
-        clip_local_frame_buffer.append(frame_for_this_step)
+        smpl_pose_row_buffer.append(interpolated_smpl_pose)
+        smpl_joints_row_buffer.append(interpolated_smpl_joints)
+        body_quat_w_row_buffer.append(interpolated_body_quat_w)
         global_frame_buffer.append(global_stream_frame_index)
         global_stream_frame_index += 1
 
-        # advance within clip unless holding at frame 0
         if not is_holding_first_frame:
-            current_frame_index += 1
-            if current_frame_index >= clip.num_frames:
-                current_frame_index = 0
+            clip_frame_delta_per_output_tick = float(clip.clip_fps) / float(target_output_frames_per_second)
+            continuous_clip_frame_index += clip_frame_delta_per_output_tick
+            if continuous_clip_frame_index >= float(clip.num_frames):
+                continuous_clip_frame_index = 0.0
                 is_holding_first_frame = True
-                print(f"  '{clip.name}' ended — holding frame 0")
+                is_streaming = False
+                zmq_socket.send(build_command_message(start=True, stop=False, planner=True))
+                zmq_socket.send(build_planner_message(0, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]))
+                print(
+                    f"  '{clip.name}' ended — holding smpl pose/joints @ frame 0, "
+                    f"root orientation @ frame {clip.num_frames - 1}"
+                )
 
         # ---- send packet once buffer is full ----
-        if len(clip_local_frame_buffer) >= NUM_FRAMES_PER_PACKET:
-            packet = _build_pose_packet(clip, clip_local_frame_buffer, global_frame_buffer)
+        if len(global_frame_buffer) >= NUM_FRAMES_PER_PACKET:
+            smpl_pose_batch = np.stack(smpl_pose_row_buffer, axis=0)
+            smpl_joints_batch = np.stack(smpl_joints_row_buffer, axis=0)
+            body_quat_w_batch = np.stack(body_quat_w_row_buffer, axis=0)
+            packet = _build_pose_packet_from_interpolated_batches(
+                smpl_pose_batch=smpl_pose_batch,
+                smpl_joints_batch=smpl_joints_batch,
+                body_quat_w_batch=body_quat_w_batch,
+                global_frame_indices=global_frame_buffer,
+            )
             zmq_socket.send(packet)
-            clip_local_frame_buffer.clear()
+            smpl_pose_row_buffer.clear()
+            smpl_joints_row_buffer.clear()
+            body_quat_w_row_buffer.clear()
             global_frame_buffer.clear()
 
-        # ---- advance deadline by one sub-frame (cumulative-correction scheduling) ----
-        next_send_time += 1.0 / clip.clip_fps
+        # ---- advance deadline (cumulative correction keeps long-run rate near target) ----
+        next_output_deadline_monotonic += output_period_seconds
 
         # ---- optional SMPL skeleton window (throttled; does not affect ZMQ timing) ----
         if smpl_skeleton_viewer is not None:
             now = time.monotonic()
             if now - last_skeleton_visualization_time >= visualization_interval_seconds:
-                smpl_skeleton_viewer.update_skeleton(clip.smpl_joints[frame_for_this_step])
+                smpl_skeleton_viewer.update_skeleton(interpolated_smpl_joints)
                 smpl_skeleton_viewer.refresh()
                 last_skeleton_visualization_time = now
+
+
+# ---------------------------------------------------------------------------
+# Sim elastic band (ROS 2)
+# ---------------------------------------------------------------------------
+
+
+def release_sim_elastic_band(wait_seconds: float = 1.0) -> None:
+    """Publish /sim/release_band so MuJoCo drops the robot (same as key 9)."""
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import Empty
+
+    owned_init = not rclpy.ok()
+    if owned_init:
+        rclpy.init()
+    node = Node("amass_release_band")
+    publisher = node.create_publisher(Empty, "/sim/release_band", 10)
+    time.sleep(0.2)
+    publisher.publish(Empty())
+    node.destroy_node()
+    if owned_init and rclpy.ok():
+        rclpy.shutdown()
+    print(f"Released sim elastic band, waiting {wait_seconds:.1f} s ...")
+    time.sleep(wait_seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +682,14 @@ def run_player(
 
 
 def main() -> None:
+    # 在做任何事之前保存终端设置，并确保 OPOST 开启
+    # （上次 tty.setraw 意外退出可能留下 OPOST=0，导致 \n 不含 \r 而输出错位）
+    _stdin_fd = sys.stdin.fileno()
+    _original_term = termios.tcgetattr(_stdin_fd)
+    _fixed_term = list(_original_term)
+    _fixed_term[1] |= termios.OPOST   # oflag: 恢复输出处理，使 \n -> \r\n
+    termios.tcsetattr(_stdin_fd, termios.TCSANOW, _fixed_term)
+
     parser = argparse.ArgumentParser(
         description="Stream AMASS-style npz motions over ZMQ (Pico-compatible pose protocol v3).",
     )
@@ -532,11 +707,33 @@ def main() -> None:
             "``xyzw`` matches intentele ``motion_lib_smpl_npz.py``; use ``wxyz`` for scalar-first files."
         ),
     )
+    parser.add_argument(
+        "--target-fps",
+        type=float,
+        default=50.0,
+        help=(
+            "Uniform output timeline in Hz (like Pico pose stream target_fps). "
+            "Clip content advances in real time: clip_frame_delta = clip_fps / target_fps per tick."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-yaml",
+        type=pathlib.Path,
+        default=DEFAULT_DATASET_YAML,
+        help="Intentele dataset yaml listing motion npz files (default: test_dataset.yaml).",
+    )
+    parser.add_argument(
+        "--intentele-root",
+        type=pathlib.Path,
+        default=_DEFAULT_INTENTELE_ROOT,
+        help="Intentele repo root; used to resolve root_path in the dataset yaml.",
+    )
     arguments = parser.parse_args()
 
-    print(f"Scanning {MOTIONS_DIRECTORY} ...")
-    clips = load_all_clips(
-        MOTIONS_DIRECTORY,
+    print(f"Loading clips from {arguments.dataset_yaml} ...")
+    clips = load_clips_from_dataset_yaml(
+        arguments.dataset_yaml,
+        arguments.intentele_root,
         root_orientation_disk_component_order=arguments.root_orientation_disk_order,
     )
 
@@ -552,10 +749,23 @@ def main() -> None:
     print(f"ZMQ PUB socket bound on tcp://*:{ZMQ_PORT}")
 
     try:
-        run_player(clips, zmq_socket, smpl_skeleton_viewer=smpl_skeleton_viewer)
+        release_sim_elastic_band(wait_seconds=1.0)
+    except Exception as error:
+        print(f"Could not release elastic band via ROS2: {error}")
+        print("  Start sim with --enable-ros2-sim-reset, or press 9 in the sim window.")
+
+    try:
+        run_player(
+            clips,
+            zmq_socket,
+            smpl_skeleton_viewer=smpl_skeleton_viewer,
+            target_output_frames_per_second=float(arguments.target_fps),
+        )
     except KeyboardInterrupt:
         pass
     finally:
+        # 无论以何种方式退出都还原终端到运行前的状态
+        termios.tcsetattr(_stdin_fd, termios.TCSADRAIN, _original_term)
         if smpl_skeleton_viewer is not None:
             smpl_skeleton_viewer.close()
         zmq_socket.close()

@@ -147,7 +147,6 @@ case $PACKAGE_MANAGER in
             build-essential \
             clang \
             cmake \
-            cmake-format \
             cppcheck \
             git \
             git-lfs \

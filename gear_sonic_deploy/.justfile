@@ -3,7 +3,9 @@
 # run `just` from this directory to see available commands
 
 alias b := build
+alias bd := build-debug
 alias r := run
+alias rd := run-debug
 alias t := test
 alias c := clean
 alias ch := check
@@ -15,17 +17,36 @@ default:
 # Get the number of cores
 CORES := if os() == "macos" { `sysctl -n hw.ncpu` } else if os() == "linux" { `nproc` } else { "1" }
 
-# Build the project
+# Build the project (default: Release)
 build *build_type='Release':
   @mkdir -p build
-  @echo "Configuring the build system..."
+  @echo "Configuring the build system ({{build_type}})..."
   @cd build && cmake -S .. -B . -DCMAKE_BUILD_TYPE={{build_type}} -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
   @echo "Building the project..."
   @cd build && cmake --build . -j{{CORES}}
+  @if [ "{{build_type}}" = "Debug" ]; then \
+    echo "✅ Build complete! Executable: target/debug/g1_deploy_onnx_ref"; \
+  else \
+    echo "✅ Build complete! Executable: target/release/g1_deploy_onnx_ref"; \
+  fi
 
-# Run a package
-run *package='hello':
-  @./target/release/{{package}}
+# Build Debug version (convenience alias)
+build-debug:
+  @just build Debug
+
+# Run a package (default: Release)
+# Usage: just run g1_deploy_onnx_ref arg1 arg2 --flag value
+#        just run [package] [args...]  # package defaults to 'g1_deploy_onnx_ref'
+# Note: All arguments after package name are passed to the executable
+run package='g1_deploy_onnx_ref' *args:
+  @./target/release/{{package}} {{args}}
+
+# Run Debug version
+# Usage: just run-debug g1_deploy_onnx_ref arg1 arg2 --flag value
+#        just run-debug [package] [args...]  # package defaults to 'g1_deploy_onnx_ref'
+# Note: All arguments after package name are passed to the executable
+run-debug package='g1_deploy_onnx_ref' *args:
+  @./target/debug/{{package}} {{args}}
 
 # Run code quality tools
 test:

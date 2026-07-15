@@ -12,7 +12,7 @@ import pickle
 import tempfile
 from threading import Lock, Thread
 import time
-from typing import Dict
+from typing import Dict, Optional
 import xml.etree.ElementTree as ET
 
 import mujoco
@@ -25,6 +25,12 @@ from gear_sonic.utils.mujoco_sim.metric_utils import check_contact, check_height
 from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
 from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
 from gear_sonic.utils.mujoco_sim.robot import Robot
+from gear_sonic.utils.mujoco_sim.ros2_joint_state_publisher import Ros2JointStatePublisher
+from gear_sonic.utils.mujoco_sim.ros2_tf_publisher import Ros2TfPublisher
+from gear_sonic.utils.mujoco_sim.ros2_body_state_publisher import Ros2BodyStatePublisher
+from gear_sonic.utils.mujoco_sim.ros2_sim_reset_subscriber import Ros2SimResetSubscriber
+from gear_sonic.utils.mujoco_sim.elevation_map_publisher import ElevationMapPublisher
+from gear_sonic.utils.mujoco_sim.lidar_pointcloud_publisher import LidarPointCloudPublisher
 
 GEAR_SONIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
@@ -194,8 +200,8 @@ class DefaultEnv:
                     self.mj_model,
                     self.mj_data,
                     key_callback=self.elastic_band.MujuocoKeyCallback,
-                    show_left_ui=False,
-                    show_right_ui=False,
+                    show_left_ui=True,
+                    show_right_ui=True,
                 )
             else:
                 mujoco.mj_forward(self.mj_model, self.mj_data)
@@ -447,6 +453,15 @@ class DefaultEnv:
         self.mj_data.qvel[1] += vel_world[1]
         mujoco.mj_forward(self.mj_model, self.mj_data)
 
+    def viewer_should_step(self) -> bool:
+        """Return False when the passive MuJoCo viewer UI is paused."""
+        if self.viewer is None:
+            return True
+        sim = self.viewer._get_sim()
+        if sim is None:
+            return False
+        return bool(sim.run)
+
     def update_viewer(self):
         if self.viewer is not None:
             self.viewer.sync()
@@ -568,6 +583,156 @@ class BaseSimulator:
 
         self.sim_thread = None
 
+        self._ros2_body_state_publisher: Optional[Ros2BodyStatePublisher] = None
+        self._ros2_body_state_period_steps: int = 0
+        if self.config.get("ENABLE_ROS2_BODY_STATE", False):
+            try:
+                prefix = self.config.get("ROS2_BODY_STATE_TOPIC_PREFIX", "/sim/bodies")
+                rate_hz = float(self.config.get("ROS2_BODY_STATE_RATE_HZ", 200.0))
+                rate_hz = max(rate_hz, 1e-3)
+                self._ros2_body_state_period_steps = max(1, int(round((1.0 / rate_hz) / self.sim_dt)))
+                self._ros2_body_state_publisher = Ros2BodyStatePublisher(
+                    mj_model=self.sim_env.mj_model,
+                    topic_prefix=prefix,
+                )
+                print(
+                    f"[ROS2] BodyState publishing enabled on {prefix!r}/{{poses,velocities}} "
+                    f"(~{rate_hz:.1f} Hz, every {self._ros2_body_state_period_steps} sim steps, "
+                    f"{self.sim_env.mj_model.nbody - 1} bodies)."
+                )
+            except Exception as e:
+                print(f"[ROS2] BodyState publishing disabled: {e}")
+                self._ros2_body_state_publisher = None
+                self._ros2_body_state_period_steps = 0
+
+        self._ros2_tf_publisher: Optional[Ros2TfPublisher] = None
+        self._ros2_tf_period_steps: int = 0
+        if self.config.get("ENABLE_ROS2_TF", False):
+            try:
+                rate_hz = float(self.config.get("ROS2_TF_RATE_HZ", 50.0))
+                rate_hz = max(rate_hz, 1e-3)
+                self._ros2_tf_period_steps = max(1, int(round((1.0 / rate_hz) / self.sim_dt)))
+                self._ros2_tf_publisher = Ros2TfPublisher(
+                    mj_model=self.sim_env.mj_model,
+                    parent_frame_id=self.config.get("ROS2_TF_PARENT_FRAME_ID", "world"),
+                    child_frame_id=self.config.get("ROS2_TF_CHILD_FRAME_ID", "pelvis"),
+                    body_name=self.config.get("ROS2_TF_BODY_NAME", "pelvis"),
+                )
+                print(
+                    f"[ROS2] TF publishing enabled "
+                    f"{self.config.get('ROS2_TF_PARENT_FRAME_ID', 'world')!r} -> "
+                    f"{self.config.get('ROS2_TF_CHILD_FRAME_ID', 'pelvis')!r} "
+                    f"(~{rate_hz:.1f} Hz, every {self._ros2_tf_period_steps} sim steps)."
+                )
+            except Exception as e:
+                print(f"[ROS2] TF publishing disabled: {e}")
+                self._ros2_tf_publisher = None
+                self._ros2_tf_period_steps = 0
+
+        self._ros2_joint_state: Optional[Ros2JointStatePublisher] = None
+        self._ros2_joint_state_period_steps: int = 0
+        if self.config.get("ENABLE_ROS2_JOINT_STATE", False):
+            try:
+                topic = self.config.get("ROS2_JOINT_STATE_TOPIC", "/joint_states")
+                rate_hz = float(self.config.get("ROS2_JOINT_STATE_RATE_HZ", 50.0))
+                rate_hz = max(rate_hz, 1e-3)
+                self._ros2_joint_state_period_steps = max(1, int(round((1.0 / rate_hz) / self.sim_dt)))
+                self._ros2_joint_state = Ros2JointStatePublisher(
+                    mj_model=self.sim_env.mj_model,
+                    topic=topic,
+                )
+                print(
+                    f"[ROS2] JointState publishing enabled on {topic!r} "
+                    f"(~{rate_hz:.1f} Hz, every {self._ros2_joint_state_period_steps} sim steps)."
+                )
+            except Exception as e:
+                print(f"[ROS2] JointState publishing disabled: {e}")
+                self._ros2_joint_state = None
+                self._ros2_joint_state_period_steps = 0
+
+        self._elevation_map_publisher: Optional[ElevationMapPublisher] = None
+        self._elevation_map_period_steps: int = 0
+        if self.config.get("ENABLE_ROS2_ELEVATION_MAP", False):
+            try:
+                topic = self.config.get("ROS2_ELEVATION_MAP_TOPIC", "/elevation_map")
+                rate_hz = float(self.config.get("ROS2_ELEVATION_MAP_RATE_HZ", 20.0))
+                rate_hz = max(rate_hz, 1e-3)
+                self._elevation_map_period_steps = max(1, int(round((1.0 / rate_hz) / self.sim_dt)))
+                self._elevation_map_publisher = ElevationMapPublisher(
+                    mj_model=self.sim_env.mj_model,
+                    topic=topic,
+                    sensor_body_name=self.config.get(
+                        "ROS2_ELEVATION_MAP_BODY_NAME", "torso_link"
+                    ),
+                    terrain_geom_group=self.config.get(
+                        "ROS2_ELEVATION_MAP_TERRAIN_GEOM_GROUP", 2
+                    ),
+                )
+                print(
+                    f"[ROS2] ElevationMap publishing enabled on {topic!r} "
+                    f"(~{rate_hz:.1f} Hz, every {self._elevation_map_period_steps} sim steps)."
+                )
+            except Exception as e:
+                print(f"[ROS2] ElevationMap publishing disabled: {e}")
+                self._elevation_map_publisher = None
+                self._elevation_map_period_steps = 0
+
+        self._lidar_pointcloud_publisher: Optional[LidarPointCloudPublisher] = None
+        self._lidar_pointcloud_period_steps: int = 0
+        if self.config.get("ENABLE_ROS2_LIDAR_POINTCLOUD", False):
+            try:
+                topic = self.config.get("ROS2_LIDAR_POINTCLOUD_TOPIC", "/lidar_points")
+                rate_hz = float(self.config.get("ROS2_LIDAR_POINTCLOUD_RATE_HZ", 10.0))
+                rate_hz = max(rate_hz, 1e-3)
+                self._lidar_pointcloud_period_steps = max(1, int(round((1.0 / rate_hz) / self.sim_dt)))
+                self._lidar_pointcloud_publisher = LidarPointCloudPublisher(
+                    mj_model=self.sim_env.mj_model,
+                    topic=topic,
+                    site_name=self.config.get("LIDAR_SITE_NAME", "lidar"),
+                    scan_type=self.config.get("LIDAR_SCAN_TYPE", "mid360"),
+                    backend=self.config.get("LIDAR_BACKEND", "jax"),
+                )
+                print(
+                    f"[ROS2] LiDAR PointCloud publishing enabled on {topic!r} "
+                    f"(~{rate_hz:.1f} Hz, every {self._lidar_pointcloud_period_steps} sim steps)."
+                )
+            except Exception as e:
+                print(f"[ROS2] LiDAR PointCloud publishing disabled: {e}")
+                self._lidar_pointcloud_publisher = None
+                self._lidar_pointcloud_period_steps = 0
+
+        self._ros2_sim_reset_subscriber: Optional[Ros2SimResetSubscriber] = None
+        if self.config.get("ENABLE_ROS2_SIM_RESET", False):
+            try:
+                reset_topic = self.config.get("ROS2_SIM_RESET_TOPIC", "/sim/reset")
+                release_band_topic = self.config.get("ROS2_RELEASE_BAND_TOPIC", "/sim/release_band")
+                self._ros2_sim_reset_subscriber = Ros2SimResetSubscriber(
+                    on_reset=self._reset_simulation_to_initial_pose,
+                    on_release_band=self._release_elastic_band,
+                    reset_topic=reset_topic,
+                    release_band_topic=release_band_topic,
+                )
+                print(
+                    f"[ROS2] Sim commands enabled (SUB {reset_topic!r}, {release_band_topic!r})."
+                )
+            except Exception as error:
+                print(f"[ROS2] Sim commands disabled: {error}")
+                self._ros2_sim_reset_subscriber = None
+
+    def _reset_simulation_to_initial_pose(self) -> None:
+        self.sim_env.reset()
+        mujoco.mj_forward(self.sim_env.mj_model, self.sim_env.mj_data)
+        self.unitree_bridge.reset()
+        print("[ROS2] Sim reset to initial pose.")
+
+    def _release_elastic_band(self) -> None:
+        elastic_band = getattr(self.sim_env, "elastic_band", None)
+        if elastic_band is None:
+            print("[ROS2] No elastic band in this scene.")
+            return
+        elastic_band.enable = False
+        print("[ROS2] Elastic band released (same as pressing 9).")
+
     def start_as_thread(self):
         self.sim_thread = Thread(target=self.start)
         self.sim_thread.start()
@@ -601,6 +766,35 @@ class BaseSimulator:
                 step_start = time.monotonic()
 
                 self.sim_env.sim_step()
+
+                if self._ros2_body_state_publisher is not None and self._ros2_body_state_period_steps > 0:
+                    if sim_cnt % self._ros2_body_state_period_steps == 0:
+                        self._ros2_body_state_publisher.publish(self.sim_env.mj_data)
+                    self._ros2_body_state_publisher.spin_once()
+
+                if self._ros2_sim_reset_subscriber is not None:
+                    self._ros2_sim_reset_subscriber.spin_once()
+
+                if self._ros2_tf_publisher is not None and self._ros2_tf_period_steps > 0:
+                    if sim_cnt % self._ros2_tf_period_steps == 0:
+                        self._ros2_tf_publisher.publish(self.sim_env.mj_data)
+                    self._ros2_tf_publisher.spin_once()
+
+                if self._ros2_joint_state is not None and self._ros2_joint_state_period_steps > 0:
+                    if sim_cnt % self._ros2_joint_state_period_steps == 0:
+                        self._ros2_joint_state.publish(self.sim_env.mj_data)
+                    self._ros2_joint_state.spin_once()
+
+                if self._elevation_map_publisher is not None and self._elevation_map_period_steps > 0:
+                    if sim_cnt % self._elevation_map_period_steps == 0:
+                        self._elevation_map_publisher.publish(self.sim_env.mj_data)
+                    self._elevation_map_publisher.spin_once()
+
+                if self._lidar_pointcloud_publisher is not None and self._lidar_pointcloud_period_steps > 0:
+                    if sim_cnt % self._lidar_pointcloud_period_steps == 0:
+                        self._lidar_pointcloud_publisher.publish(self.sim_env.mj_data)
+                    self._lidar_pointcloud_publisher.spin_once()
+
                 now = time.time()
                 if now - ts > 1 / 10.0 and self.redis_client is not None:
                     head_pose = self.sim_env.get_head_pose()
@@ -609,6 +803,14 @@ class BaseSimulator:
                     ts = now
 
                 if sim_cnt % int(self.viewer_dt / self.sim_dt) == 0:
+                    if (
+                        self._elevation_map_publisher is not None
+                        and self.sim_env.viewer is not None
+                    ):
+                        self._elevation_map_publisher.update_viewer_markers(
+                            self.sim_env.viewer,
+                            self.sim_env.mj_data,
+                        )
                     self.sim_env.update_viewer()
 
                 if sim_cnt % int(self.reward_dt / self.sim_dt) == 0:
@@ -638,6 +840,24 @@ class BaseSimulator:
     def close(self):
         self._running = False
         try:
+            if self._ros2_body_state_publisher is not None:
+                self._ros2_body_state_publisher.close()
+                self._ros2_body_state_publisher = None
+            if self._ros2_sim_reset_subscriber is not None:
+                self._ros2_sim_reset_subscriber.close()
+                self._ros2_sim_reset_subscriber = None
+            if self._ros2_tf_publisher is not None:
+                self._ros2_tf_publisher.close()
+                self._ros2_tf_publisher = None
+            if self._ros2_joint_state is not None:
+                self._ros2_joint_state.close()
+                self._ros2_joint_state = None
+            if self._elevation_map_publisher is not None:
+                self._elevation_map_publisher.close()
+                self._elevation_map_publisher = None
+            if self._lidar_pointcloud_publisher is not None:
+                self._lidar_pointcloud_publisher.close()
+                self._lidar_pointcloud_publisher = None
             if self.sim_env.image_publish_process is not None:
                 self.sim_env.image_publish_process.stop()
             if self.sim_env.viewer is not None:

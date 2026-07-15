@@ -7,11 +7,11 @@
  * by the main control loop.  It creates and owns:
  *   - SimpleKeyboard   (index 0, default)
  *   - Gamepad          (index 1)
- *   - ZMQEndpointInterface (index 2)
+ *   - ZMQManager       (index 2)
  *   - ROS2InputHandler (index 3, only when compiled with HAS_ROS2)
  *
  * Switching is done via **keyboard shortcuts** typed into the terminal:
- *   '!' → Keyboard  |  '@' → Gamepad  |  '#' → ZMQ  |  '$' → ROS2
+ *   '!' → Keyboard  |  '@' → Gamepad  |  '#' → ZMQManager  |  '$' → ROS2
  *
  * The manager also handles several **global** controls that work regardless of
  * which interface is active:
@@ -19,6 +19,7 @@
  *   - g/G, h/H → left-hand compliance ±0.1
  *   - b/B, v/V → right-hand compliance ±0.1
  *   - x/X, c/C → hand max-close ratio ±0.1
+ *   - Y/y      → toggle residual correction
  *
  * When switching interfaces, a **safety reset** is triggered on *all* managed
  * interfaces to prevent stale planner / streaming state from carrying over.
@@ -36,7 +37,7 @@
 #include "input_interface.hpp"
 #include "keyboard_handler.hpp"
 #include "gamepad.hpp"
-#include "zmq_endpoint_interface.hpp"
+#include "zmq_manager.hpp"
 
 #if HAS_ROS2
 #include "ros2_input_handler.hpp"
@@ -56,15 +57,15 @@ class InterfaceManager : public InputInterface {
     enum class ManagedType {
       KEYBOARD = 0,  ///< SimpleKeyboard (stdin)
       GAMEPAD = 1,   ///< Unitree wireless gamepad
-      ZMQ = 2,       ///< ZMQ packed-message streaming
+      ZMQ_MANAGER = 2,  ///< ZMQManager (planner + streamed motion)
       ROS2 = 3       ///< ROS 2 teleop (requires HAS_ROS2)
     };
 
     /**
      * @brief Construct the manager, creating all sub-interfaces.
-     * @param zmq_host     ZMQ server hostname (passed to ZMQEndpointInterface).
+     * @param zmq_host     ZMQ server hostname (passed to ZMQManager).
      * @param zmq_port     ZMQ server port.
-     * @param zmq_topic    ZMQ subscription topic.
+     * @param zmq_topic    ZMQ pose subscription topic.
      * @param zmq_conflate Whether to enable ZMQ conflate (latest-only) mode.
      * @param zmq_verbose  Enable verbose ZMQ logging.
      */
@@ -100,7 +101,7 @@ class InterfaceManager : public InputInterface {
             is_manager_key = true;
             break;
           case '#': 
-            SetActiveInterface(ManagedType::ZMQ); 
+            SetActiveInterface(ManagedType::ZMQ_MANAGER); 
             is_manager_key = true;
             break;
           case '$': 
@@ -156,6 +157,10 @@ class InterfaceManager : public InputInterface {
           case 'F':
             // Global temperature report
             report_temperature_flag_ = true;
+          case 'y':
+          case 'Y':
+            // Toggle residual correction (encoder + delta*0.2 → decoder)
+            ToggleResidualCorrection();
             is_manager_key = true;
             break;
         }
@@ -292,10 +297,10 @@ class InterfaceManager : public InputInterface {
       gamepad_ = std::make_unique<unitree::common::Gamepad>();
       order_.push_back(ManagedType::GAMEPAD);
 
-      zmq_ = std::make_unique<ZMQEndpointInterface>(
-        zmq_host_, zmq_port_, zmq_topic_, zmq_conflate_, zmq_verbose_
+      zmq_ = std::make_unique<ZMQManager>(
+        zmq_host_, zmq_port_, zmq_topic_, "command", "planner", zmq_conflate_, zmq_verbose_
       );
-      order_.push_back(ManagedType::ZMQ);
+      order_.push_back(ManagedType::ZMQ_MANAGER);
 
 #if HAS_ROS2
       ros2_ = std::make_unique<ROS2InputHandler>(true, "g1_deploy_ros2_handler");
@@ -332,10 +337,10 @@ class InterfaceManager : public InputInterface {
           type_ = InputType::GAMEPAD;
           std::cout << "[InterfaceManager] Switched to: GAMEPAD (safety reset triggered)" << std::endl;
           break;
-        case ManagedType::ZMQ:
+        case ManagedType::ZMQ_MANAGER:
           current_ = zmq_.get();
           type_ = InputType::NETWORK;
-          std::cout << "[InterfaceManager] Switched to: ZMQ (safety reset triggered)" << std::endl;
+          std::cout << "[InterfaceManager] Switched to: ZMQ_MANAGER (safety reset triggered)" << std::endl;
           break;
         case ManagedType::ROS2:
 #if HAS_ROS2
@@ -363,7 +368,7 @@ class InterfaceManager : public InputInterface {
     // ------------------------------------------------------------------
     std::unique_ptr<SimpleKeyboard> keyboard_;              ///< Keyboard handler.
     std::unique_ptr<unitree::common::Gamepad> gamepad_;     ///< Gamepad handler.
-    std::unique_ptr<ZMQEndpointInterface> zmq_;             ///< ZMQ streaming handler.
+    std::unique_ptr<ZMQManager> zmq_;                       ///< ZMQ manager (planner + streamed motion).
 #if HAS_ROS2
     std::unique_ptr<ROS2InputHandler> ros2_;                ///< ROS 2 teleop handler.
 #endif
