@@ -519,8 +519,8 @@ protected:
     std::atomic<double> max_close_ratio_{1.0};
 
     /// Runtime enable for residual correction after the encoder (Y/y toggle).
-    /// Default true so a loaded residual stack is active until the operator disables it.
-    std::atomic<bool> residual_correction_enabled_{true};
+    /// Default false so a loaded residual stack stays off until the operator enables it.
+    std::atomic<bool> residual_correction_enabled_{false};
 
     /// Shared stdin buffer – the InterfaceManager pushes non-manager keys here
     /// for the currently-active interface to consume via ReadStdinChar().
