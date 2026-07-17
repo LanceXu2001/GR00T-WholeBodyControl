@@ -1,0 +1,35 @@
+local_elevation_node:
+  ros__parameters:
+    # Static global point cloud (in map_frame)
+    pcd_path: "/home/malab/XJL/project/GR00T-WholeBodyControl/gear_sonic_deploy/map/Intentele/Preview.pcd"
+
+    # TF frames
+    map_frame: "map"
+    base_frame: "base_link"
+
+    # Local elevation window (must match residual height_scanner 15x15 @ 0.1 m)
+    length_x: 1.5   # forward extent  (+X_local)
+    length_y: 1.5   # lateral extent  (+Y_local = left)
+    resolution: 0.1
+
+    # Publish rate (Hz)
+    publish_rate: 10.0
+
+    # Per-cell ground estimate from PCD
+    use_min_z: true
+    min_points_per_cell: 1
+
+    # Z crop relative to robot (meters) before binning
+    z_min: -2.0
+    z_max: 2.0
+
+    # Match MuJoCo ElevationMapPublisher:
+    #   sensor_z = base_link_z - lidar_height_above_robot
+    #   elevation = sensor_z - ground_z - height_offset
+    # base_link is the lidar pose; lidar is 0.47618 m above the robot frame.
+    lidar_height_above_robot: 0.47618
+    height_offset: 0.5
+
+    # Output for deploy Ros2ElevationCache / residual
+    output_topic: "/elevation_map"
+    layer_name: "elevation"
