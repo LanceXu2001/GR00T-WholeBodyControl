@@ -389,18 +389,23 @@ CHECKPOINT_ENCODER="${CHECKPOINT}_encoder.onnx"
 # ZMQ host (set via command line or default)
 # ZMQ_HOST is already set from argument parsing above
 
-# Additional flags for simulation mode
+# Extra runtime flags (sim-only CRC/CSV + residual for both sim and real)
 EXTRA_ARGS=""
 if [[ "$ENV_TYPE" == "sim" ]]; then
     EXTRA_ARGS="--disable-crc-check"
     EXTRA_ARGS="$EXTRA_ARGS --enable-csv-logs"
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
     echo ""
-    if [[ -f "$RESIDUAL_MODEL_DEFAULT" ]]; then
-        EXTRA_ARGS="$EXTRA_ARGS --residual-model $RESIDUAL_MODEL_DEFAULT"
-        echo -e "${YELLOW}📋 Residual model: $RESIDUAL_MODEL_DEFAULT${NC}"
-        echo ""
-    fi
+fi
+
+# Load residual by default for sim and real (runtime Y/y toggles correction; default OFF).
+if [[ -f "$RESIDUAL_MODEL_DEFAULT" ]]; then
+    EXTRA_ARGS="$EXTRA_ARGS --residual-model $RESIDUAL_MODEL_DEFAULT"
+    echo -e "${YELLOW}📋 Residual model: $RESIDUAL_MODEL_DEFAULT (Y/y toggle, default OFF)${NC}"
+    echo ""
+else
+    echo -e "${YELLOW}⚠️  Residual model not found: $RESIDUAL_MODEL_DEFAULT (residual stack disabled)${NC}"
+    echo ""
 fi
 
 # ============================================================================
