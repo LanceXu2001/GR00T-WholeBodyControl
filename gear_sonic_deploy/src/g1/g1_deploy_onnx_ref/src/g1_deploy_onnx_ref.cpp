@@ -2694,7 +2694,7 @@ class G1Deploy {
         residual_stack_enabled_ = true;
         std::cout << "✓ Residual stack enabled (model: " << residual_model_file_path_argument_ << ")" << std::endl;
         std::cout << "  Token update: token_state += residual_output * " << kResidualTokenScale << std::endl;
-        std::cout << "  Keyboard: Y/y toggles residual correction at runtime (default: ENABLED)" << std::endl;
+        std::cout << "  Keyboard: Y/y toggles residual correction at runtime (default: OFF)" << std::endl;
       }
       
       // =========================================================================
@@ -2883,9 +2883,10 @@ class G1Deploy {
         std::cout << "[INFO] Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1 (range: 0.01-0.5)" << std::endl;
         std::cout << "[INFO] Keyboard controls: x/c = hand max close ratio +/- 0.1 (range: 0.2-1.0)" << std::endl;
         if (residual_stack_enabled_) {
-          input_interface_->SetResidualCorrectionEnabled(true);
+          // Keep residual correction off until the operator enables it with Y/y.
+          input_interface_->SetResidualCorrectionEnabled(false);
           std::cout << "[INFO] Keyboard controls: Y/y = toggle residual correction "
-                       "(token += residual * " << kResidualTokenScale << ")" << std::endl;
+                       "(default OFF; token += residual * " << kResidualTokenScale << ")" << std::endl;
         }
         // Info message about compliance observation status
         if (!has_vr_3point_compliance_obs_) {

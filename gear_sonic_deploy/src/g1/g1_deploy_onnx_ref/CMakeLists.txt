@@ -292,7 +292,9 @@ target_link_libraries(
   ${EXE_LIBS}
 )
 
-# Setting our output directory and C++ standard
+# Setting our output directory and C++ standard.
+# GNU extensions (gnu++20) are required for Unitree's bundled CycloneDDS C++
+# headers (ddscxx) under GCC; strict -std=c++20 breaks operator new(size_t).
 # Output to target/debug or target/release based on build type
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   set(OUTPUT_DIR "${PROJECT_SOURCE_DIR}/target/debug/")
@@ -321,6 +323,12 @@ if(rclcpp_FOUND AND std_msgs_FOUND)
   
   # Add ROS2 support to main executable (requires msgpack)
   target_include_directories(${EXECUTABLE_NAME} PRIVATE ${ROS2_INCLUDE_DIRS} ${MSGPACK_INCLUDE_DIRS})
+  # Keep Unitree SDK / CycloneDDS / project ORT headers ahead of any residual ROS paths
+  target_include_directories(${EXECUTABLE_NAME} BEFORE PRIVATE
+    ${PROJECT_SOURCE_DIR}/thirdparty/unitree_sdk2/include
+    ${PROJECT_SOURCE_DIR}/thirdparty/unitree_sdk2/thirdparty/include
+    ${PROJECT_SOURCE_DIR}/thirdparty/unitree_sdk2/thirdparty/include/ddscxx
+    ${onnxruntime_INCLUDE_DIR})
   target_link_libraries(${EXECUTABLE_NAME} PRIVATE ${ROS2_LIBS} pthread)
   target_compile_definitions(${EXECUTABLE_NAME} PRIVATE HAS_ROS2=1)
   
@@ -356,4 +364,4 @@ set_target_properties(
              OUTPUT_NAME run_tests
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
-             CXX_EXTENSIONS OFF)
+             CXX_EXTENSIONS ON)

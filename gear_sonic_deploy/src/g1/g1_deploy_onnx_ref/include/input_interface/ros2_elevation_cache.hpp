@@ -29,8 +29,9 @@ static constexpr const char* kResidualElevationMapTopic = "/elevation_map";
 /// Frame whose world/map Z is used as sensor_z (height scanner body).
 static constexpr const char* kElevationSensorFrameId = "torso_link";
 
-/// Frame in which absolute ground_z / sensor_z are expressed (matches sim ``world``).
-static constexpr const char* kElevationHeightReferenceFrameId = "world";
+/// Frame in which absolute ground_z / sensor_z are expressed.
+/// Prefer this name first; lookup also falls back to ``map`` then ``world``.
+static constexpr const char* kElevationHeightReferenceFrameId = "map";
 
 /// Training offset applied after relative height: sensor_z - ground_z - offset.
 static constexpr float kElevationPolicyHeightOffset = 0.5f;
@@ -94,8 +95,7 @@ public:
                   << topic_name << " (QoS depth=10 RELIABLE)" << std::endl;
         std::cout << "[Ros2ElevationCache] Policy height = sensor_z - ground_z - "
                   << kElevationPolicyHeightOffset
-                  << " (TF " << height_reference_frame_id_ << " → "
-                  << sensor_frame_id_ << ")" << std::endl;
+                  << " (TF map|world → " << sensor_frame_id_ << ")" << std::endl;
 
         const auto timer_period_ms = static_cast<int>(1000.0 / cache_update_hz);
         elevation_cache_update_timer_ = node_->create_wall_timer(
@@ -190,23 +190,34 @@ private:
     }
 
     bool try_lookup_sensor_z(float& sensor_z_out) {
-        try {
-            const geometry_msgs::msg::TransformStamped transform =
-                tf_buffer_->lookupTransform(
-                    height_reference_frame_id_,
-                    sensor_frame_id_,
-                    tf2::TimePointZero);
-            sensor_z_out = static_cast<float>(transform.transform.translation.z);
-            return std::isfinite(sensor_z_out);
-        } catch (const tf2::TransformException& ex) {
-            RCLCPP_WARN_THROTTLE(
-                node_->get_logger(), *node_->get_clock(), 5000,
-                "[Ros2ElevationCache] TF %s→%s unavailable (%s); skipping frame.",
-                height_reference_frame_id_.c_str(),
-                sensor_frame_id_.c_str(),
-                ex.what());
-            return false;
+        // Sim uses ``world``; real localization uses ``map``. Try both.
+        const std::string candidates[] = {
+            height_reference_frame_id_,
+            "map",
+            "world",
+        };
+        std::string last_error;
+        for (const std::string& parent_frame : candidates) {
+            try {
+                const geometry_msgs::msg::TransformStamped transform =
+                    tf_buffer_->lookupTransform(
+                        parent_frame,
+                        sensor_frame_id_,
+                        tf2::TimePointZero);
+                sensor_z_out = static_cast<float>(transform.transform.translation.z);
+                if (std::isfinite(sensor_z_out)) {
+                    return true;
+                }
+            } catch (const tf2::TransformException& ex) {
+                last_error = ex.what();
+            }
         }
+        RCLCPP_WARN_THROTTLE(
+            node_->get_logger(), *node_->get_clock(), 5000,
+            "[Ros2ElevationCache] TF {map|world}→%s unavailable (%s); skipping frame.",
+            sensor_frame_id_.c_str(),
+            last_error.c_str());
+        return false;
     }
 
     void on_timer_update_cache() {

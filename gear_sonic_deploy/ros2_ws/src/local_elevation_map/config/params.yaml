@@ -3,9 +3,12 @@ local_elevation_node:
     # Static global point cloud (in map_frame)
     pcd_path: "/home/malab/XJL/project/GR00T-WholeBodyControl/gear_sonic_deploy/map/Intentele/Preview.pcd"
 
-    # TF frames (base_frame matches deploy sensor frame / localization child)
+    # TF frames (base_frame = localization child / deploy sensor frame)
+    # GridMap is published in grid_frame; node broadcasts map→grid:
+    #   torso XY, Z=0, yaw-only (matches MuJoCo ElevationMapPublisher).
     map_frame: "map"
     base_frame: "torso_link"
+    grid_frame: "elevation_map"
 
     # Local elevation window (must match residual height_scanner 15x15 @ 0.1 m)
     length_x: 1.5   # forward extent  (+X_local)

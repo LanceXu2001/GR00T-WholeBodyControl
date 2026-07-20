@@ -12,6 +12,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -27,12 +28,13 @@
  * - Flat buffer is ColMajor / F-order: k = ix + iy * n_forward
  *     ix = 0 .. n_forward-1 : front → rear
  *     iy = 0 .. n_lateral-1 : left  → right
- *   so cell 0 is front-left (+half_f, +half_l). CNN [0,0] = front-left,
- *   CNN [0,1] = one cell to its right (after Ros2ElevationCache remapping).
+ *   so cell 0 is front-left (+half_f, +half_l).
  * - Layer ``elevation`` = absolute map-frame ground_z (same as MuJoCo).
  *   Missing cells publish 0.0. Policy height conversion
  *   (sensor_z - ground_z - 0.5) is done in deploy Ros2ElevationCache via TF.
- * - Publishes grid_map_msgs/GridMap on /elevation_map with layer "elevation".
+ * - Publishes GridMap in ``elevation_map`` frame and broadcasts
+ *   map → elevation_map TF: torso XY, Z = 0, yaw-only (no pitch/roll),
+ *   matching MuJoCo so RViz is level and ground-aligned.
  */
 class LocalElevationNode : public rclcpp::Node
 {
@@ -40,11 +42,13 @@ public:
   LocalElevationNode()
   : Node("local_elevation_node"),
     tf_buffer_(get_clock()),
-    tf_listener_(tf_buffer_)
+    tf_listener_(tf_buffer_),
+    tf_broadcaster_(this)
   {
     pcd_path_ = declare_parameter<std::string>("pcd_path", "");
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
     base_frame_ = declare_parameter<std::string>("base_frame", "torso_link");
+    grid_frame_ = declare_parameter<std::string>("grid_frame", "elevation_map");
     length_x_ = declare_parameter<double>("length_x", 1.5);   // forward extent
     length_y_ = declare_parameter<double>("length_y", 1.5);   // lateral extent
     resolution_ = declare_parameter<double>("resolution", 0.1);
@@ -88,8 +92,11 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "Local elevation ready: grid=%dx%d (F×L) res=%.3fm "
-      "front-left=first (CNN[0,0]), absolute ground_z, z_crop around %s, topic=%s",
-      n_forward_, n_lateral_, resolution_, base_frame_.c_str(),
+      "front-left=first, absolute ground_z, TF %s→%s (torso XY, z=0, yaw-only), "
+      "sensor TF %s→%s, topic=%s",
+      n_forward_, n_lateral_, resolution_,
+      map_frame_.c_str(), grid_frame_.c_str(),
+      map_frame_.c_str(), base_frame_.c_str(),
       output_topic_.c_str());
   }
 
@@ -142,7 +149,7 @@ private:
     elevation_layer.layout = elevation_layout;
     elevation_layer.data = elevation_data_;
 
-    grid_map_msg_.header.frame_id = base_frame_;
+    grid_map_msg_.header.frame_id = grid_frame_;
     grid_map_msg_.info.resolution = static_cast<float>(resolution_);
     grid_map_msg_.info.length_x = static_cast<float>(n_forward_ * resolution_);
     grid_map_msg_.info.length_y = static_cast<float>(n_lateral_ * resolution_);
@@ -158,6 +165,15 @@ private:
   {
     // geometry_msgs uses (x, y, z, w); match MuJoCo yaw-from-quat about +Z.
     return std::atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z));
+  }
+
+  static void yawToQuat(double yaw, double & x, double & y, double & z, double & w)
+  {
+    const double half = 0.5 * yaw;
+    x = 0.0;
+    y = 0.0;
+    z = std::sin(half);
+    w = std::cos(half);
   }
 
   void onTimer()
@@ -242,8 +258,30 @@ private:
         (accum[idx] / static_cast<float>(counts[idx]));
     }
 
-    grid_map_msg_.header.stamp = now();
-    grid_map_msg_.header.frame_id = base_frame_;
+    const auto stamp = now();
+
+    // Level elevation_map frame: torso XY, map Z = 0, yaw-only (match MuJoCo).
+    double qx = 0.0;
+    double qy = 0.0;
+    double qz = 0.0;
+    double qw = 1.0;
+    yawToQuat(yaw, qx, qy, qz, qw);
+
+    geometry_msgs::msg::TransformStamped grid_tf;
+    grid_tf.header.stamp = stamp;
+    grid_tf.header.frame_id = map_frame_;
+    grid_tf.child_frame_id = grid_frame_;
+    grid_tf.transform.translation.x = robot_x;
+    grid_tf.transform.translation.y = robot_y;
+    grid_tf.transform.translation.z = 0.0;
+    grid_tf.transform.rotation.x = qx;
+    grid_tf.transform.rotation.y = qy;
+    grid_tf.transform.rotation.z = qz;
+    grid_tf.transform.rotation.w = qw;
+    tf_broadcaster_.sendTransform(grid_tf);
+
+    grid_map_msg_.header.stamp = stamp;
+    grid_map_msg_.header.frame_id = grid_frame_;
     grid_map_msg_.info.pose.position.x = 0.0;
     grid_map_msg_.info.pose.position.y = 0.0;
     grid_map_msg_.info.pose.position.z = 0.0;
@@ -258,6 +296,7 @@ private:
   std::string pcd_path_;
   std::string map_frame_;
   std::string base_frame_;
+  std::string grid_frame_;
   double length_x_{1.5};
   double length_y_{1.5};
   double resolution_{0.1};
@@ -278,6 +317,7 @@ private:
   pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
+  tf2_ros::TransformBroadcaster tf_broadcaster_;
   rclcpp::Publisher<grid_map_msgs::msg::GridMap>::SharedPtr map_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
