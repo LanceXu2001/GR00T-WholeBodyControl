@@ -408,6 +408,16 @@ else
     echo ""
 fi
 
+# Scheme B: sim publishes world→torso_link; real localization publishes map→torso_link.
+if [[ "$ENV_TYPE" == "sim" ]]; then
+    EXTRA_ARGS="$EXTRA_ARGS --elevation-height-frame world"
+    echo -e "${YELLOW}📋 Elevation TF parent: world (sim)${NC}"
+else
+    EXTRA_ARGS="$EXTRA_ARGS --elevation-height-frame map"
+    echo -e "${YELLOW}📋 Elevation TF parent: map (real)${NC}"
+fi
+echo ""
+
 # ============================================================================
 # Step 1: Check Prerequisites
 # ============================================================================

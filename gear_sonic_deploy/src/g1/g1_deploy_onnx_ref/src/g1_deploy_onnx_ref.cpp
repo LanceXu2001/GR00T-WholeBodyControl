@@ -39,6 +39,7 @@
  *   --obs-config          | Observation config YAML
  *   --encoder-model       | Encoder ONNX model (for token_state)
  *   --residual-model      | Optional residual ONNX (obs_dict -> delta_token); requires residual.enabled in YAML
+ *   --elevation-height-frame | TF parent for sensor_z (world=sim, map=real; default: world)
  *   --planner-model       | Locomotion planner ONNX model
  *   --input-type          | keyboard / gamepad / zmq / ros2 / interface_manager / gamepad_manager / zmq_manager
  *   --output-type         | zmq / ros2 / all
@@ -379,6 +380,8 @@ class G1Deploy {
     /// Dedicated thread that subscribes to the elevation GridMap topic and
     /// caches the latest frame.  Created when residual_stack_enabled_ is true.
     std::unique_ptr<Ros2ElevationCache> elevation_cache_;
+    /// TF parent frame for elevation sensor_z lookup (sim: world, real: map).
+    std::string elevation_height_reference_frame_id_{"world"};
 #endif
     static constexpr int kResidualHistoryStepCount = 10;
     static constexpr float kResidualTokenScale = 0.2f;
@@ -2401,7 +2404,8 @@ class G1Deploy {
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
-      std::string residual_model_file_path = "")
+      std::string residual_model_file_path = "",
+      std::string elevation_height_reference_frame_id = "world")
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2420,9 +2424,15 @@ class G1Deploy {
         initial_vr_3point_compliance_(initial_compliance),
         initial_max_close_ratio_(initial_max_close_ratio),
         residual_model_file_path_argument_(std::move(residual_model_file_path)),
+#if HAS_ROS2
+        elevation_height_reference_frame_id_(std::move(elevation_height_reference_frame_id)),
+#endif
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
+#if !HAS_ROS2
+      (void)elevation_height_reference_frame_id;
+#endif
       
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
@@ -2847,7 +2857,13 @@ class G1Deploy {
         elevation_cache_ = std::make_unique<Ros2ElevationCache>(
             kResidualElevationMapTopic,
             residual_config_.height_scanner_row_count,
-            residual_config_.height_scanner_column_count);
+            residual_config_.height_scanner_column_count,
+            /*cache_update_hz=*/50.0,
+            kElevationSensorFrameId,
+            elevation_height_reference_frame_id_);
+        std::cout << "[INFO] Elevation height TF parent frame: "
+                  << elevation_height_reference_frame_id_
+                  << " → " << kElevationSensorFrameId << std::endl;
       }
 #endif
 
@@ -4478,6 +4494,10 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
+#if HAS_ROS2
+    std::cout << "  --elevation-height-frame <world|map>: TF parent for residual sensor_z "
+                 "(sim=world, real=map; default: world)" << std::endl;
+#endif
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
     std::cout << "  --policy-precision <16|32>: specify precision to run the policy model at (default: 32)" << std::endl;
@@ -4541,6 +4561,7 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  std::string elevationHeightReferenceFrame = "world"; // sim default; deploy.sh real passes map
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4570,6 +4591,23 @@ int main(int argc, char const* argv[]) {
         i++;
       } else {
         std::cerr << "Error: --residual-model requires a path argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--elevation-height-frame") {
+      if (i + 1 < argc) {
+        elevationHeightReferenceFrame = argv[i + 1];
+        if (elevationHeightReferenceFrame != "world" &&
+            elevationHeightReferenceFrame != "map") {
+          std::cerr << "Error: --elevation-height-frame must be 'world' or 'map'"
+                    << std::endl;
+          exit(1);
+        }
+        std::cout << "[INFO] Elevation height TF parent frame: "
+                  << elevationHeightReferenceFrame << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --elevation-height-frame requires 'world' or 'map'"
+                  << std::endl;
         exit(1);
       }
     } else if (std::string(argv[i]) == "--planner-file") {
@@ -4812,7 +4850,8 @@ int main(int argc, char const* argv[]) {
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio,
-    residualModelFile
+    residualModelFile,
+    elevationHeightReferenceFrame
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

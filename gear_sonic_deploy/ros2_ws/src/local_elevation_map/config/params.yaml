@@ -3,9 +3,9 @@ local_elevation_node:
     # Static global point cloud (in map_frame)
     pcd_path: "/home/malab/XJL/project/GR00T-WholeBodyControl/gear_sonic_deploy/map/Intentele/Preview.pcd"
 
-    # TF frames
+    # TF frames (base_frame matches deploy sensor frame / localization child)
     map_frame: "map"
-    base_frame: "base_link"
+    base_frame: "torso_link"
 
     # Local elevation window (must match residual height_scanner 15x15 @ 0.1 m)
     length_x: 1.5   # forward extent  (+X_local)
@@ -19,16 +19,12 @@ local_elevation_node:
     use_min_z: true
     min_points_per_cell: 1
 
-    # Z crop relative to base_link (meters) before binning
+    # Z crop relative to torso_link (meters) before binning
     z_min: -2.0
     z_max: 2.0
 
-    # Match MuJoCo ElevationMapPublisher: layer "elevation" = absolute ground_z.
+    # Layer "elevation" = absolute map-frame ground_z (MuJoCo ElevationMapPublisher).
     # Policy height (sensor_z - ground_z - 0.5) is computed in deploy Ros2ElevationCache.
-    # base_link ≈ torso_link after lidar_tf extrinsic; no extra height offset.
-    lidar_height_above_robot: 0.0
-    # Unused here (kept for compatibility); deploy applies 0.5.
-    height_offset: 0.5
 
     # Output for deploy Ros2ElevationCache / residual
     output_topic: "/elevation_map"

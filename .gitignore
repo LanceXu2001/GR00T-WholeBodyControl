@@ -195,7 +195,15 @@ teleop_vids/
 
 # gear_sonic_deploy local build / runtime artifacts
 gear_sonic_deploy/_build_*/
-gear_sonic_deploy/ros2_ws/
+# Ignore ros2_ws contents, but keep tracked packages under src/local_elevation_map
+# (and rviz_config). Parent dirs must be un-ignored for negation to work.
+gear_sonic_deploy/ros2_ws/*
+!gear_sonic_deploy/ros2_ws/src/
+gear_sonic_deploy/ros2_ws/src/*
+!gear_sonic_deploy/ros2_ws/src/local_elevation_map/
+!gear_sonic_deploy/ros2_ws/src/local_elevation_map/**
+!gear_sonic_deploy/ros2_ws/src/rviz_config/
+!gear_sonic_deploy/ros2_ws/src/rviz_config/**
 gear_sonic_deploy/third_party/
 gear_sonic_deploy/collect/
 gear_sonic_deploy/reference/motions/

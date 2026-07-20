@@ -30,8 +30,6 @@
  * - Layer ``elevation`` = absolute map-frame ground_z (same as MuJoCo).
  *   Missing cells publish 0.0. Policy height conversion
  *   (sensor_z - ground_z - 0.5) is done in deploy Ros2ElevationCache via TF.
- * - ``lidar_height_above_robot`` only shifts the Z crop window relative to
- *   base_link (default 0 when base_link ≈ torso_link).
  * - Publishes grid_map_msgs/GridMap on /elevation_map with layer "elevation".
  */
 class LocalElevationNode : public rclcpp::Node
@@ -44,7 +42,7 @@ public:
   {
     pcd_path_ = declare_parameter<std::string>("pcd_path", "");
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
-    base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
+    base_frame_ = declare_parameter<std::string>("base_frame", "torso_link");
     length_x_ = declare_parameter<double>("length_x", 1.5);   // forward extent
     length_y_ = declare_parameter<double>("length_y", 1.5);   // lateral extent
     resolution_ = declare_parameter<double>("resolution", 0.1);
@@ -53,11 +51,6 @@ public:
     min_points_per_cell_ = declare_parameter<int>("min_points_per_cell", 1);
     z_min_ = declare_parameter<double>("z_min", -2.0);
     z_max_ = declare_parameter<double>("z_max", 2.0);
-    // Kept for compatibility; conversion is done in deploy (ignored here).
-    height_offset_ = declare_parameter<double>("height_offset", 0.5);
-    // Z-crop offset below base_link. 0 when base_link ≈ torso_link.
-    lidar_height_above_robot_ =
-      declare_parameter<double>("lidar_height_above_robot", 0.0);
     output_topic_ = declare_parameter<std::string>("output_topic", "/elevation_map");
     layer_name_ = declare_parameter<std::string>("layer_name", "elevation");
 
@@ -93,10 +86,9 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "Local elevation ready: grid=%dx%d (F×L) res=%.3fm "
-      "rear-right=first, absolute ground_z, z_crop_ref=base_z-%.5f, topic=%s",
-      n_forward_, n_lateral_, resolution_, lidar_height_above_robot_,
+      "rear-right=first, absolute ground_z, z_crop around %s, topic=%s",
+      n_forward_, n_lateral_, resolution_, base_frame_.c_str(),
       output_topic_.c_str());
-    (void)height_offset_;
   }
 
 private:
@@ -180,9 +172,7 @@ private:
 
     const double robot_x = tf.transform.translation.x;
     const double robot_y = tf.transform.translation.y;
-    // base_link ≈ torso_link; optional offset only for Z crop window.
-    const double base_link_z = tf.transform.translation.z;
-    const double z_crop_ref = base_link_z - lidar_height_above_robot_;
+    const double body_z = tf.transform.translation.z;
     const double yaw = yawFromQuat(
       tf.transform.rotation.x,
       tf.transform.rotation.y,
@@ -200,12 +190,12 @@ private:
       Eigen::Vector4f(
         static_cast<float>(robot_x - half_diag),
         static_cast<float>(robot_y - half_diag),
-        static_cast<float>(z_crop_ref + z_min_), 1.0f));
+        static_cast<float>(body_z + z_min_), 1.0f));
     crop.setMax(
       Eigen::Vector4f(
         static_cast<float>(robot_x + half_diag),
         static_cast<float>(robot_y + half_diag),
-        static_cast<float>(z_crop_ref + z_max_), 1.0f));
+        static_cast<float>(body_z + z_max_), 1.0f));
 
     pcl::PointCloud<pcl::PointXYZ> local_cloud;
     crop.filter(local_cloud);
@@ -273,8 +263,6 @@ private:
   int min_points_per_cell_{1};
   double z_min_{-2.0};
   double z_max_{2.0};
-  double height_offset_{0.5};  // unused; deploy applies policy offset
-  double lidar_height_above_robot_{0.0};
   std::string output_topic_;
   std::string layer_name_;
 
