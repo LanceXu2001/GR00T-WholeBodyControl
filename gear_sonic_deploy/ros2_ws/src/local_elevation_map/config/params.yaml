@@ -19,15 +19,15 @@ local_elevation_node:
     use_min_z: true
     min_points_per_cell: 1
 
-    # Z crop relative to robot (meters) before binning
+    # Z crop relative to base_link (meters) before binning
     z_min: -2.0
     z_max: 2.0
 
-    # Match MuJoCo ElevationMapPublisher:
-    #   sensor_z = base_link_z - lidar_height_above_robot
-    #   elevation = sensor_z - ground_z - height_offset
-    # base_link is the lidar pose; lidar is 0.47618 m above the robot frame.
-    lidar_height_above_robot: 0.47618
+    # Match MuJoCo ElevationMapPublisher: layer "elevation" = absolute ground_z.
+    # Policy height (sensor_z - ground_z - 0.5) is computed in deploy Ros2ElevationCache.
+    # base_link ≈ torso_link after lidar_tf extrinsic; no extra height offset.
+    lidar_height_above_robot: 0.0
+    # Unused here (kept for compatibility); deploy applies 0.5.
     height_offset: 0.5
 
     # Output for deploy Ros2ElevationCache / residual
