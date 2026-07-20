@@ -658,6 +658,12 @@ class BaseSimulator:
                 rate_hz = float(self.config.get("ROS2_ELEVATION_MAP_RATE_HZ", 20.0))
                 rate_hz = max(rate_hz, 1e-3)
                 self._elevation_map_period_steps = max(1, int(round((1.0 / rate_hz) / self.sim_dt)))
+                parent_frame_id = self.config.get(
+                    "ROS2_ELEVATION_MAP_PARENT_FRAME_ID", "world"
+                )
+                grid_frame_id = self.config.get(
+                    "ROS2_ELEVATION_MAP_GRID_FRAME_ID", "elevation_map"
+                )
                 self._elevation_map_publisher = ElevationMapPublisher(
                     mj_model=self.sim_env.mj_model,
                     topic=topic,
@@ -667,10 +673,13 @@ class BaseSimulator:
                     terrain_geom_group=self.config.get(
                         "ROS2_ELEVATION_MAP_TERRAIN_GEOM_GROUP", 2
                     ),
+                    parent_frame_id=parent_frame_id,
+                    grid_frame_id=grid_frame_id,
                 )
                 print(
-                    f"[ROS2] ElevationMap publishing enabled on {topic!r} "
-                    f"(~{rate_hz:.1f} Hz, every {self._elevation_map_period_steps} sim steps)."
+                    f"[ROS2] ElevationMap on {topic!r} "
+                    f"(TF {parent_frame_id!r}→{grid_frame_id!r}, ground_z, "
+                    f"~{rate_hz:.1f} Hz)."
                 )
             except Exception as e:
                 print(f"[ROS2] ElevationMap publishing disabled: {e}")

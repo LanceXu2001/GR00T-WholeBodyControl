@@ -367,26 +367,25 @@ class SimLoopConfig(BaseConfig):
     """Approximate publish rate for JointState (Hz)."""
 
     enable_ros2_elevation_map: bool = False
-    """If True, compute a heading-aligned elevation map via mj_ray and publish it (requires ROS 2)."""
+    """If True, publish absolute ground_z GridMap via mj_ray (requires ROS 2)."""
 
     ros2_elevation_map_topic: str = "/elevation_map"
-    """ROS 2 topic name for the elevation map (grid_map_msgs/GridMap, layer ``elevation``)."""
+    """ROS 2 topic for grid_map_msgs/GridMap (layer ``elevation`` = absolute ground_z)."""
 
     ros2_elevation_map_body_name: str = "torso_link"
-    """MuJoCo body name for height-scanner pose and heading (default: torso_link)."""
+    """Body used for grid XY / yaw (pitch/roll ignored; frame Z stays at world 0)."""
+
+    ros2_elevation_map_parent_frame_id: str = "world"
+    """Parent of TF ``parent`` → ``elevation_map`` (default matches ``world``→``pelvis``)."""
+
+    ros2_elevation_map_grid_frame_id: str = "elevation_map"
+    """GridMap / child TF frame (torso XY, z=0, yaw-only)."""
 
     ros2_elevation_map_rate_hz: float = 20.0
-    """Approximate publish rate for the elevation map (Hz)."""
+    """Elevation map publish rate (Hz)."""
 
     ros2_elevation_map_terrain_geom_group: int = 2
-    """MuJoCo geom group used for terrain-only raycasts (``group=2`` in scene XML)."""
-
-    show_elevation_viewer_markers: bool = False
-    """Draw red sphere markers at elevation ray hits in the MuJoCo viewer (debug only).
-
-    Disabled by default — 225 ``mjv_initGeom`` calls per viewer frame cost ~3–6 Hz on
-    ``/elevation_map``.  Enable with ``--show-elevation-viewer-markers`` when debugging.
-    """
+    """MuJoCo geom group for terrain-only raycasts."""
 
     enable_ros2_lidar_pointcloud: bool = False
     """If True, publish sensor_msgs/PointCloud2 from simulated LiDAR (requires ROS 2 and mujoco-lidar)."""

@@ -48,11 +48,16 @@ def main(config: ArgsConfig):
     wbc_config["ENABLE_ROS2_ELEVATION_MAP"] = config.enable_ros2_elevation_map
     wbc_config["ROS2_ELEVATION_MAP_TOPIC"] = config.ros2_elevation_map_topic
     wbc_config["ROS2_ELEVATION_MAP_BODY_NAME"] = config.ros2_elevation_map_body_name
+    wbc_config["ROS2_ELEVATION_MAP_PARENT_FRAME_ID"] = (
+        config.ros2_elevation_map_parent_frame_id
+    )
+    wbc_config["ROS2_ELEVATION_MAP_GRID_FRAME_ID"] = (
+        config.ros2_elevation_map_grid_frame_id
+    )
     wbc_config["ROS2_ELEVATION_MAP_RATE_HZ"] = config.ros2_elevation_map_rate_hz
     wbc_config["ROS2_ELEVATION_MAP_TERRAIN_GEOM_GROUP"] = (
         config.ros2_elevation_map_terrain_geom_group
     )
-    wbc_config["SHOW_ELEVATION_VIEWER_MARKERS"] = config.show_elevation_viewer_markers
     wbc_config["ENABLE_ROS2_LIDAR_POINTCLOUD"] = config.enable_ros2_lidar_pointcloud
     wbc_config["ROS2_LIDAR_POINTCLOUD_TOPIC"] = config.ros2_lidar_pointcloud_topic
     wbc_config["ROS2_LIDAR_POINTCLOUD_RATE_HZ"] = config.ros2_lidar_pointcloud_rate_hz

@@ -85,6 +85,8 @@ encoder:
 # At runtime: token_state += residual_output * 0.2 before the decoder.
 # Keyboard Y/y toggles residual correction (default OFF when the stack loads).
 # The elevation map ROS2 topic is fixed in code (kResidualElevationMapTopic = "/elevation_map").
+# Controller converts absolute ground_z → policy height via TF torso_link Z:
+#   policy_height = sensor_z - ground_z - 0.5  (see Ros2ElevationCache).
 residual:
   enabled: true
   use_fp16: false
