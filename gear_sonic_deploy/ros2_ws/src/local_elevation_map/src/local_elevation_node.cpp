@@ -24,9 +24,11 @@
  * Local elevation map node aligned with MuJoCo ElevationMapPublisher semantics:
  *
  * - Heading-aligned local frame: +X_local = forward (yaw only), +Y_local = left.
- * - Flat buffer is F-order of height[forward, lateral]:
- *     k = forward + lateral * n_forward
- *   so cell 0 is the rear-right corner (-half_f, -half_l).
+ * - Flat buffer is ColMajor / F-order: k = ix + iy * n_forward
+ *     ix = 0 .. n_forward-1 : front → rear
+ *     iy = 0 .. n_lateral-1 : left  → right
+ *   so cell 0 is front-left (+half_f, +half_l). CNN [0,0] = front-left,
+ *   CNN [0,1] = one cell to its right (after Ros2ElevationCache remapping).
  * - Layer ``elevation`` = absolute map-frame ground_z (same as MuJoCo).
  *   Missing cells publish 0.0. Policy height conversion
  *   (sensor_z - ground_z - 0.5) is done in deploy Ros2ElevationCache via TF.
@@ -86,7 +88,7 @@ public:
     RCLCPP_INFO(
       get_logger(),
       "Local elevation ready: grid=%dx%d (F×L) res=%.3fm "
-      "rear-right=first, absolute ground_z, z_crop around %s, topic=%s",
+      "front-left=first (CNN[0,0]), absolute ground_z, z_crop around %s, topic=%s",
       n_forward_, n_lateral_, resolution_, base_frame_.c_str(),
       output_topic_.c_str());
   }
@@ -212,15 +214,16 @@ private:
       const double local_forward = cos_yaw * dx + sin_yaw * dy;
       const double local_lateral = -sin_yaw * dx + cos_yaw * dy;
 
+      // Match MuJoCo: ix=0 front (+X), iy=0 left (+Y); ColMajor k = ix + iy * n_f.
       const int i_f = static_cast<int>(std::lround(
-        (local_forward + forward_half_span_) / resolution_));
+        (forward_half_span_ - local_forward) / resolution_));
       const int i_l = static_cast<int>(std::lround(
-        (local_lateral + lateral_half_span_) / resolution_));
+        (lateral_half_span_ - local_lateral) / resolution_));
       if (i_f < 0 || i_f >= n_forward_ || i_l < 0 || i_l >= n_lateral_) {
         continue;
       }
 
-      // F-order: forward varies fastest → rear-right is index 0.
+      // ColMajor: front-left is index 0 → CNN [0,0] after deploy remapping.
       const size_t linear = static_cast<size_t>(i_f + i_l * n_forward_);
       counts[linear] += 1;
       accum[linear] += pt.z;

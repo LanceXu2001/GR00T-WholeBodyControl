@@ -250,9 +250,9 @@ private:
             return;
         }
 
-        // Publisher: grid_map ColMajor flat[ix + iy * n_rows],
-        //   ix = forward_from_front, iy = lateral_from_left.
-        // CNN: row-major flat[i * n_cols + j], [0,0] = front-left.
+        // Publisher (MuJoCo + local_elevation_node): ColMajor flat[ix + iy * n_rows],
+        //   ix = 0 front → rear, iy = 0 left → right.
+        // CNN: row-major flat[i * n_cols + j]; [0,0]=front-left, [0,1]=one cell right.
         {
             std::lock_guard<std::mutex> lock(latest_elevation_mutex_);
             latest_elevation_row_major_.resize(expected_count);
